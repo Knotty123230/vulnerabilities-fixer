@@ -32,6 +32,32 @@ public class Vulnchecker implements Runnable {
     )
     private boolean saveNexusCredentials;
 
+    @CommandLine.Option(names = "--scan-sonatype", description = "Run a Sonatype Lifecycle scan after the Nexus version check.")
+    private boolean scanSonatype;
+
+    @CommandLine.Option(names = "--sonatype-url", description = "Sonatype Lifecycle server URL.")
+    private String sonatypeUrl;
+
+    @CommandLine.Option(names = "--sonatype-application-id", description = "Sonatype Lifecycle application ID.")
+    private String sonatypeApplicationId;
+
+    @CommandLine.Option(names = "--sonatype-username", description = "Sonatype Lifecycle username.")
+    private String sonatypeUsername;
+
+    @CommandLine.Option(
+            names = "--sonatype-password",
+            arity = "0..1",
+            interactive = true,
+            description = "Sonatype Lifecycle password. When supplied without a value, prompts without echo."
+    )
+    private String sonatypePassword;
+
+    @CommandLine.Option(
+            names = "--save-sonatype-credentials",
+            description = "Save Sonatype URL, application ID and username in ~/.vulnchecker; save the password in macOS Keychain."
+    )
+    private boolean saveSonatypeCredentials;
+
 
     public static void main(String[] args) {
         int exitCode = new CommandLine(new Vulnchecker()).execute(args);
@@ -58,6 +84,10 @@ public class Vulnchecker implements Runnable {
         nexusVersionResolver.getNewerVersions("org.apache.commons", "commons-lang3", "3.12.0").forEach(version -> {
             System.out.println("Newer version available: " + version);
         });
+
+        if (scanSonatype) {
+            new SonatypeProcessor(resolveSonatypeCredentials()).scan(filePath);
+        }
 
 //        var path = new MavenDependencyTreePluginExecutor().execute(filePath);
 //        System.out.println("Dependency tree JSON: " + path);
@@ -94,5 +124,31 @@ public class Vulnchecker implements Runnable {
             }
         }
         return null;
+    }
+
+    private SonatypeCredentials resolveSonatypeCredentials() {
+        SonatypeCredentialsStore store = new SonatypeCredentialsStore();
+        Optional<SonatypeCredentialsStore.SonatypeSettings> savedSettings = store.loadSettings();
+
+        String url = firstNonBlank(sonatypeUrl, savedSettings.map(SonatypeCredentialsStore.SonatypeSettings::serverUrl).orElse(null));
+        String applicationId = firstNonBlank(
+                sonatypeApplicationId,
+                savedSettings.map(SonatypeCredentialsStore.SonatypeSettings::applicationId).orElse(null)
+        );
+        String username = firstNonBlank(
+                sonatypeUsername,
+                savedSettings.map(SonatypeCredentialsStore.SonatypeSettings::username).orElse(null)
+        );
+        String password = firstNonBlank(
+                sonatypePassword,
+                System.getenv("VULNCHECKER_SONATYPE_PASSWORD"),
+                username == null ? null : store.loadPassword(username).orElse(null)
+        );
+
+        SonatypeCredentials credentials = new SonatypeCredentials(url, applicationId, username, password);
+        if (saveSonatypeCredentials) {
+            store.save(credentials);
+        }
+        return credentials;
     }
 }
