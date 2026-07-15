@@ -81,7 +81,7 @@ public class Vulnchecker implements Runnable {
                 credentials.username(),
                 credentials.password());
 
-        nexusVersionResolver.getNewerVersions("org.apache.commons", "commons-lang3", "3.12.0").forEach(version -> {
+        nexusVersionResolver.getNewerVersions("com.fasterxml.jackson.core", "jackson-databind", "2.21.3").forEach(version -> {
             System.out.println("Newer version available: " + version);
         });
 
