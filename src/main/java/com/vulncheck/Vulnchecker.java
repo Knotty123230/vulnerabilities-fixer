@@ -33,9 +33,9 @@ public class Vulnchecker implements Runnable {
     private boolean saveNexusCredentials;
 
 
-    static void main(String[] args) {
-        new CommandLine(new Vulnchecker()).execute(args);
-
+    public static void main(String[] args) {
+        int exitCode = new CommandLine(new Vulnchecker()).execute(args);
+        System.exit(exitCode);
     }
 
 

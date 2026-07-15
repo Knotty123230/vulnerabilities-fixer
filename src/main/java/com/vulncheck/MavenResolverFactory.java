@@ -1,10 +1,11 @@
 package com.vulncheck;
 
+import org.apache.maven.repository.internal.MavenRepositorySystemUtils;
+import org.eclipse.aether.DefaultRepositorySystemSession;
 import org.eclipse.aether.RepositorySystem;
 import org.eclipse.aether.RepositorySystemSession;
 import org.eclipse.aether.repository.LocalRepository;
 import org.eclipse.aether.supplier.RepositorySystemSupplier;
-import org.eclipse.aether.supplier.SessionBuilderSupplier;
 
 import java.nio.file.Path;
 
@@ -21,23 +22,17 @@ public final class MavenResolverFactory {
             RepositorySystem repositorySystem,
             Path localRepositoryPath
     ) {
-        var sessionBuilder =
-                new SessionBuilderSupplier(repositorySystem).get();
-
-        var temporarySession = sessionBuilder.build();
-
+        DefaultRepositorySystemSession session = MavenRepositorySystemUtils.newSession();
         LocalRepository localRepository =
                 new LocalRepository(localRepositoryPath);
 
-        sessionBuilder.setLocalRepositoryManager(
+        session.setLocalRepositoryManager(
                 repositorySystem.newLocalRepositoryManager(
-                        temporarySession,
+                        session,
                         localRepository
                 )
         );
-
-        sessionBuilder.setOffline(false);
-
-        return sessionBuilder.build();
+        session.setOffline(false);
+        return session;
     }
 }
