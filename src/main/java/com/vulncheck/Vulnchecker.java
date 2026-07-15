@@ -86,7 +86,7 @@ public class Vulnchecker implements Runnable {
         });
 
         if (scanSonatype) {
-            new SonatypeProcessor(resolveSonatypeCredentials()).scan(filePath);
+            new SonatypeProcessor(resolveSonatypeCredentials()).scan(filePath, sonatypeApplicationId);
         }
 
 //        var path = new MavenDependencyTreePluginExecutor().execute(filePath);
