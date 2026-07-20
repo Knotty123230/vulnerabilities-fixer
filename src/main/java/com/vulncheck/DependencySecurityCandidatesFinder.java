@@ -82,6 +82,7 @@ public class DependencySecurityCandidatesFinder {
                             directDependency.getArtifactId(),
                             directDependency.getVersion()
                     ));
+                    newerVersions = new ArrayList<>(filterSameMajorVersion(newerVersions, directDependency.getVersion()));
                     newerVersions.sort(Comparator.comparing(i -> i.substring(i.lastIndexOf("."))));
 
                     // Перевіряємо, чи належить залежність до локстеп-групи
@@ -98,52 +99,117 @@ public class DependencySecurityCandidatesFinder {
                 }
 
                 case MANAGED_BY_PARENT -> {
-                    // Версією керує <parent>.
-                    // Тобі треба дістати координати Parent-а (наприклад, org.springframework.boot:spring-boot-starter-parent)
-                    // і шукати нові версії ДЛЯ PARENT-а через NexusVersionResolver.
-
                     System.out.println("Потрібно оновити версію Parent POM або відповідну property.");
 
                     var parent = localProjectAnalyzer.getParentCandidate(pomFile);
+                    boolean fixed = false;
                     if (parent != null) {
                         List<String> newerParentVersions = new ArrayList<>(nexusVersionResolver.getNewerVersions(
                                 parent.getGroupId(),
                                 parent.getArtifactId(),
                                 parent.getVersion()
                         ));
+                        newerParentVersions = new ArrayList<>(filterSameMajorVersion(newerParentVersions, parent.getVersion()));
                         newerParentVersions.sort(Comparator.comparing(i -> i.substring(i.lastIndexOf("."))));
 
                         for (String newerVersion : newerParentVersions) {
-
                             String pomContent = mavenPomFixer.updatePomDryRun(pomFile, parent, newerVersion);
                             if (verifyDryRunFix(pomContent, vulnerabilityDetails)) {
                                 mavenPomFixer.updatePomFile(pomFile, parent, newerVersion);
+                                fixed = true;
                                 break;
                             }
                         }
-                    } else {
-                        System.out.println("Parent POM не знайдено.");
+                    }
+
+                    // Fallback: if no same-minor parent update fixes the vuln,
+                    // add explicit dependencyManagement override for the vulnerable artifact
+                    if (!fixed) {
+                        System.out.println("Parent update в рамках " + (parent != null ? parent.getVersion().substring(0, parent.getVersion().lastIndexOf(".")) + ".x" : "?") + " не допоміг.");
+                        System.out.println("Додаємо explicit managed dependency override для вразливого артефакту...");
+                        List<String> remediationVersions = vulnerabilityDetails.versionToFix();
+                        for (String fixVersion : remediationVersions) {
+                            if (fixVersion.equals(vulnerabilityDetails.version())) continue; // skip current version
+                            String dryResult = mavenPomFixer.addManagedDependencyOverrideDryRun(pomFile,
+                                    vulnerabilityDetails.groupId(), vulnerabilityDetails.artifactId(), fixVersion);
+                            if (verifyDryRunFix(dryResult, vulnerabilityDetails)) {
+                                mavenPomFixer.addManagedDependencyOverride(pomFile,
+                                        vulnerabilityDetails.groupId(), vulnerabilityDetails.artifactId(), fixVersion);
+                                break;
+                            }
+                        }
                     }
                 }
 
                 case MANAGED_BY_BOM -> {
                     // Версією керує BOM у <dependencyManagement>.
-                    // Тобі треба знайти, який саме BOM (наприклад, quarkus-bom) притягує цю залежність.
-                    System.out.println("Потрібно оновити версію імпортованого BOM-а.");
-                    Dependency artifact = localProjectAnalyzer.findBomManagingDependency(pomFile, directDependency);
-                    if (artifact != null) {
+                    // Спочатку шукаємо BOM що керує прямою залежністю
+                    org.apache.maven.model.Dependency bomDep = localProjectAnalyzer.findBomManagingDependency(pomFile, directDependency);
+
+                    // Якщо не знайшли BOM для прямої, пробуємо шукати для вразливого артефакту
+                    if (bomDep == null) {
+                        DefaultArtifact vulnArtifact = new DefaultArtifact(
+                                vulnerabilityDetails.groupId(),
+                                vulnerabilityDetails.artifactId(),
+                                "jar",
+                                vulnerabilityDetails.version()
+                        );
+                        bomDep = localProjectAnalyzer.findBomManagingDependency(pomFile, vulnArtifact);
+                    }
+
+                    if (bomDep != null) {
+                        System.out.println("Знайдено BOM: " + bomDep.getGroupId() + ":" + bomDep.getArtifactId() + ":" + bomDep.getVersion());
                         List<String> newerBomVersions = new ArrayList<>(nexusVersionResolver.getNewerVersions(
-                                artifact.getGroupId(),
-                                artifact.getArtifactId(),
-                                artifact.getVersion()
+                                bomDep.getGroupId(),
+                                bomDep.getArtifactId(),
+                                bomDep.getVersion()
                         ));
+                        newerBomVersions = new ArrayList<>(filterSameMajorVersion(newerBomVersions, bomDep.getVersion()));
                         newerBomVersions.sort(Comparator.comparing(i -> i.substring(i.lastIndexOf("."))));
                         for (String newerVersion : newerBomVersions) {
-                            DefaultArtifact art = new DefaultArtifact(artifact.getGroupId(), artifact.getArtifactId(), "pom", artifact.getVersion());
+                            DefaultArtifact art = new DefaultArtifact(bomDep.getGroupId(), bomDep.getArtifactId(), "pom", bomDep.getVersion());
                             String pomContent = mavenPomFixer.updatePomDryRun(pomFile, art, newerVersion);
                             if (verifyDryRunFix(pomContent, vulnerabilityDetails)) {
                                 mavenPomFixer.updatePomFile(pomFile, art, newerVersion);
                                 break;
+                            }
+                        }
+                    } else {
+                        // Fallback: якщо BOM не знайдено, спробуємо оновити parent
+                        System.out.println("BOM не знайдено, пробуємо оновити Parent POM...");
+                        var parent = localProjectAnalyzer.getParentCandidate(pomFile);
+                        boolean fixed = false;
+                        if (parent != null) {
+                            List<String> newerParentVersions = new ArrayList<>(nexusVersionResolver.getNewerVersions(
+                                    parent.getGroupId(),
+                                    parent.getArtifactId(),
+                                    parent.getVersion()
+                            ));
+                            newerParentVersions = new ArrayList<>(filterSameMajorVersion(newerParentVersions, parent.getVersion()));
+                            newerParentVersions.sort(Comparator.comparing(i -> i.substring(i.lastIndexOf("."))));
+                            for (String newerVersion : newerParentVersions) {
+                                String pomContent = mavenPomFixer.updatePomDryRun(pomFile, parent, newerVersion);
+                                if (verifyDryRunFix(pomContent, vulnerabilityDetails)) {
+                                    mavenPomFixer.updatePomFile(pomFile, parent, newerVersion);
+                                    fixed = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        // Last resort: add explicit managed dependency override
+                        if (!fixed) {
+                            System.out.println("Додаємо explicit managed dependency override...");
+                            List<String> remediationVersions = vulnerabilityDetails.versionToFix();
+                            for (String fixVersion : remediationVersions) {
+                                if (fixVersion.equals(vulnerabilityDetails.version())) continue;
+                                String dryResult = mavenPomFixer.addManagedDependencyOverrideDryRun(pomFile,
+                                        vulnerabilityDetails.groupId(), vulnerabilityDetails.artifactId(), fixVersion);
+                                if (verifyDryRunFix(dryResult, vulnerabilityDetails)) {
+                                    mavenPomFixer.addManagedDependencyOverride(pomFile,
+                                            vulnerabilityDetails.groupId(), vulnerabilityDetails.artifactId(), fixVersion);
+                                    break;
+                                }
                             }
                         }
                     }
@@ -188,6 +254,11 @@ public class DependencySecurityCandidatesFinder {
 
 
     private boolean verifyDryRunFix(String updatedPomXml, Vulnerability vuln) {
+        if (updatedPomXml == null) {
+            System.out.println("DRY RUN ❌: Рецепт не згенерував змін (версія можливо задана через property або BOM parent).");
+            return false;
+        }
+
         File tempPom = null;
         try {
             // 1. Створюємо тимчасовий файл, бо Aether потребує фізичного файлу для розв'язання шляхів
@@ -214,7 +285,6 @@ public class DependencySecurityCandidatesFinder {
         } catch (Exception e) {
             System.err.println("DRY RUN ❌: Оновлений POM-файл зламав збірку графа: " + e.getMessage());
         } finally {
-            // 4. Обов'язково прибираємо за собою
             if (tempPom != null && tempPom.exists()) {
                 tempPom.delete();
             }
@@ -241,5 +311,26 @@ public class DependencySecurityCandidatesFinder {
         }
 
         return false;
+    }
+
+    /**
+     * Filters version list to only include versions with the same major.minor version as currentVersion.
+     * Excludes milestones, RCs, alphas, betas.
+     * E.g. currentVersion="3.5.14" → keeps "3.5.15", "3.5.16" but removes "3.6.0", "4.0.0", "4.0.0-M1"
+     * E.g. currentVersion="4.0.7" → keeps "4.0.8", "4.0.9" but removes "4.1.0"
+     */
+    private List<String> filterSameMajorVersion(List<String> versions, String currentVersion) {
+        String[] currentParts = currentVersion.split("\\.");
+        String currentMajorMinor = currentParts.length >= 2
+                ? currentParts[0] + "." + currentParts[1]
+                : currentParts[0];
+        return versions.stream()
+                .filter(v -> {
+                    String[] parts = v.split("\\.");
+                    String majorMinor = parts.length >= 2 ? parts[0] + "." + parts[1] : parts[0];
+                    return majorMinor.equals(currentMajorMinor);
+                })
+                .filter(v -> !v.matches(".*-(M\\d+|RC\\d+|alpha\\d*|beta\\d*|SNAPSHOT).*"))
+                .toList();
     }
 }

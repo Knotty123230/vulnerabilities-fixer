@@ -23,7 +23,6 @@ import org.eclipse.aether.resolution.ArtifactDescriptorRequest;
 import org.eclipse.aether.resolution.ArtifactDescriptorResult;
 
 import java.io.File;
-import java.io.FileNotFoundException;
 import java.io.FileReader;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -148,21 +147,28 @@ public class LocalProjectAnalyzer {
             return UpdateStrategy.EXPLICIT_VERSION;
         }
 
-
+        // Перевіряємо чи є прямий managed entry для цієї залежності в dependencyManagement
         if (rawModel.getDependencyManagement() != null) {
-            // Груба перевірка: якщо є BOM-імпорти або прямо вказані залежності тут
-            boolean hasBomsOrManagedDeps = !rawModel.getDependencyManagement().getDependencies().isEmpty();
-            if (hasBomsOrManagedDeps) {
+            boolean directlyManagedHere = rawModel.getDependencyManagement().getDependencies().stream()
+                    .filter(d -> !"pom".equals(d.getType()) || !"import".equals(d.getScope()))
+                    .anyMatch(d -> d.getGroupId().equals(groupId) && d.getArtifactId().equals(artifactId));
+            if (directlyManagedHere) {
+                return UpdateStrategy.EXPLICIT_VERSION; // Версія задана прямо в dependencyManagement
+            }
+
+            // Перевіряємо чи є BOM-імпорти що можуть керувати цією залежністю
+            boolean hasImportedBoms = rawModel.getDependencyManagement().getDependencies().stream()
+                    .anyMatch(d -> "pom".equals(d.getType()) && "import".equals(d.getScope()));
+            if (hasImportedBoms) {
                 return UpdateStrategy.MANAGED_BY_BOM;
             }
         }
 
-        // 2. Якщо dependencyManagement порожній або відсутній, але є <parent>
+        // Якщо dependencyManagement порожній або не містить BOM-ів, але є <parent>
         if (rawModel.getParent() != null) {
             return UpdateStrategy.MANAGED_BY_PARENT;
         }
 
-        // Якщо ми дійшли сюди — це невалідний pom.xml (Maven би впав при збірці)
         throw new IllegalStateException("Dependency " + artifactId + " has no version, no parent, and no dependencyManagement.");
     }
 
