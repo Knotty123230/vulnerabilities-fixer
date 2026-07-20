@@ -22,11 +22,14 @@ public class MavenPomFixer {
         this.credentials = credentials;
     }
 
-    private void fixPom(Artifact artifact, Path pomFile, String newVersion) throws IOException {
+    /**
+     * Спільний метод для застосування рецепта.
+     * Повертає true, якщо зміни були успішно згенеровані (або застосовані).
+     */
+    private boolean applyRecipe(Artifact artifact, Path pomFile, String newVersion, boolean isDryRun) throws IOException {
         String fileContent = Files.readString(pomFile);
         ExecutionContext ctx = new InMemoryExecutionContext(Throwable::printStackTrace);
 
-        // Configure OpenRewrite to use corporate Nexus instead of Maven Central
         MavenExecutionContextView mavenCtx = MavenExecutionContextView.view(ctx);
         MavenRepository nexusRepo = new MavenRepository(
                 "nexus",
@@ -53,29 +56,83 @@ public class MavenPomFixer {
         );
 
         RecipeRun recipeRun = changeVersionRequest.run(new InMemoryLargeSourceSet(mavenDocuments), ctx);
-
         List<Result> results = recipeRun.getChangeset().getAllResults();
 
         if (!results.isEmpty()) {
             SourceFile updatedFile = results.getFirst().getAfter();
             if (updatedFile != null) {
-                Files.writeString(pomFile, updatedFile.printAll());
-                System.out.println("✅ Версія залежності " + artifact.getArtifactId() + " оновлена до " + newVersion);
+                if (isDryRun) {
+                    System.out.println("DRY RUN ℹ️: Версія залежності " + artifact.getArtifactId() + " БУЛА Б оновлена до " + newVersion);
+                } else {
+                    Files.writeString(pomFile, updatedFile.printAll());
+                    System.out.println("✅ Версія залежності " + artifact.getArtifactId() + " оновлена до " + newVersion);
+                }
+                return true; // Рецепт успішно спрацював
             }
-        } else {
-            System.out.println("ℹ️ Змін не відбулося. Залежність не знайдена або версія вже актуальна.");
+        }
+
+        return false; // Рецепт не згенерував змін
+    }
+
+    public void updatePomFile(File pomFile, Artifact directDependency, String newerVersion) {
+        try {
+            applyRecipe(directDependency, pomFile.toPath(), newerVersion, false);
+        } catch (IOException e) {
+            System.err.println("❌ Помилка при оновленні версії залежності: " + e.getMessage());
         }
     }
 
-    public void updatePomFile(File pomFile, Artifact directDependency, List<String> newerVersions) {
-        for (String newVersion : newerVersions) {
-            try {
-                fixPom(directDependency, pomFile.toPath(), newVersion);
-                break;
-            } catch (IOException e) {
-                System.err.println("❌ Помилка при оновленні версії залежності: " + e.getMessage());
+    public String updatePomDryRun(File pomFile, Artifact directDependency, String newerVersion) {
+        try {
+            // 1. Читаємо файл лише один раз
+            String fileContent = Files.readString(pomFile.toPath());
+
+            ExecutionContext ctx = new InMemoryExecutionContext(Throwable::printStackTrace);
+
+            // 2. Налаштовуємо доступ до корпоративного Nexus
+            MavenExecutionContextView mavenCtx = MavenExecutionContextView.view(ctx);
+            MavenRepository nexusRepo = new MavenRepository(
+                    "nexus",
+                    credentials.url(),
+                    "true",
+                    "true",
+                    credentials.username(),
+                    credentials.password(),
+                    null
+            );
+            mavenCtx.setRepositories(List.of(nexusRepo));
+            mavenCtx.setAddCentralRepository(false);
+
+            // 3. Парсимо pom.xml в AST (теж один раз для оптимізації)
+            MavenParser parser = MavenParser.builder().build();
+            List<SourceFile> mavenDocuments = parser.parse(ctx, fileContent).toList();
+
+            // 4. Перебираємо нові версії
+            var changeVersionRequest = new UpgradeDependencyVersion(
+                    directDependency.getGroupId(),
+                    directDependency.getArtifactId(),
+                    newerVersion,
+                    null,
+                    null,
+                    null
+            );
+
+            // Виконуємо рецепт
+            RecipeRun recipeRun = changeVersionRequest.run(new InMemoryLargeSourceSet(mavenDocuments), ctx);
+            List<Result> results = recipeRun.getChangeset().getAllResults();
+
+            if (!results.isEmpty()) {
+                SourceFile updatedFile = results.getFirst().getAfter();
+                if (updatedFile != null) {
+                    System.out.println("DRY RUN ℹ️: Знайдено працюючий рецепт для версії " + newerVersion);
+                    return updatedFile.printAll(); // Повертаємо новий XML як строку
+                }
             }
+        } catch (Exception e) {
+            System.err.println("❌ Помилка при симуляції оновлення (Dry Run): " + e.getMessage());
+            e.printStackTrace();
         }
-        System.out.println();
+
+        return null; // Жодна версія не підійшла або сталася помилка
     }
 }

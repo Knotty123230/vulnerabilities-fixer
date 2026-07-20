@@ -96,6 +96,8 @@ public class Vulnchecker implements Runnable {
         } catch (DependencyCollectionException | ModelBuildingException e) {
             System.out.println("Failed to build dependency tree");
             throw new RuntimeException(e);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
         }
 
 
