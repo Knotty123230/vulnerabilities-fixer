@@ -3,9 +3,10 @@ package com.vulncheck;
 import org.eclipse.aether.artifact.Artifact;
 import org.openrewrite.*;
 import org.openrewrite.internal.InMemoryLargeSourceSet;
-import org.openrewrite.maven.ChangeProjectVersion;
+import org.openrewrite.maven.MavenExecutionContextView;
 import org.openrewrite.maven.MavenParser;
 import org.openrewrite.maven.UpgradeDependencyVersion;
+import org.openrewrite.maven.tree.MavenRepository;
 
 import java.io.File;
 import java.io.IOException;
@@ -15,10 +16,29 @@ import java.util.List;
 
 public class MavenPomFixer {
 
+    private final NexusCredentials credentials;
+
+    public MavenPomFixer(NexusCredentials credentials) {
+        this.credentials = credentials;
+    }
 
     private void fixPom(Artifact artifact, Path pomFile, String newVersion) throws IOException {
         String fileContent = Files.readString(pomFile);
         ExecutionContext ctx = new InMemoryExecutionContext(Throwable::printStackTrace);
+
+        // Configure OpenRewrite to use corporate Nexus instead of Maven Central
+        MavenExecutionContextView mavenCtx = MavenExecutionContextView.view(ctx);
+        MavenRepository nexusRepo = new MavenRepository(
+                "nexus",
+                credentials.url(),
+                "true",
+                "true",
+                credentials.username(),
+                credentials.password(),
+                null
+        );
+        mavenCtx.setRepositories(List.of(nexusRepo));
+        mavenCtx.setAddCentralRepository(false);
 
         MavenParser parser = MavenParser.builder().build();
         List<SourceFile> mavenDocuments = parser.parse(ctx, fileContent).toList();
@@ -37,8 +57,6 @@ public class MavenPomFixer {
         List<Result> results = recipeRun.getChangeset().getAllResults();
 
         if (!results.isEmpty()) {
-            // Беремо першу (і єдину) зміну.
-            // getAfter() повертає нове LST дерево, яке ми конвертуємо назад у текст
             SourceFile updatedFile = results.getFirst().getAfter();
             if (updatedFile != null) {
                 Files.writeString(pomFile, updatedFile.printAll());

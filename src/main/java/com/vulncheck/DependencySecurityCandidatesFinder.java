@@ -9,6 +9,7 @@ import org.eclipse.aether.graph.DependencyNode;
 import org.eclipse.aether.repository.RemoteRepository;
 
 import java.io.File;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
@@ -25,7 +26,7 @@ public class DependencySecurityCandidatesFinder {
     public DependencySecurityCandidatesFinder(SonatypeScanReport report, RepositorySystem repositorySystem, RepositorySystemSession repository, NexusCredentials credentials) {
         this.report = report;
         this.nexusVersionResolver = new NexusVersionResolver(repositorySystem, repository, credentials);
-        mavenPomFixer = new MavenPomFixer();
+        mavenPomFixer = new MavenPomFixer(credentials);
         localProjectAnalyzer = new LocalProjectAnalyzer(repositorySystem, repository, List.of(new RemoteRepository.Builder(
                 "nexus",
                 "default",
@@ -65,11 +66,11 @@ public class DependencySecurityCandidatesFinder {
                     directDependency.getVersion());
 
             // 2. Використовуємо Твій існуючий код для пошуку нових версій
-            List<String> newerVersions = nexusVersionResolver.getNewerVersions(
+            List<String> newerVersions = new ArrayList<>(nexusVersionResolver.getNewerVersions(
                     directDependency.getGroupId(),
                     directDependency.getArtifactId(),
                     directDependency.getVersion()
-            );
+            ));
             newerVersions.sort(Comparator.comparing(i -> i.substring(i.lastIndexOf("."))));
 
             mavenPomFixer.updatePomFile(pomFile, directDependency, newerVersions);
