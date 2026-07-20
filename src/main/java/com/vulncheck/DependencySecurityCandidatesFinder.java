@@ -9,6 +9,7 @@ import org.eclipse.aether.graph.DependencyNode;
 import org.eclipse.aether.repository.RemoteRepository;
 
 import java.io.File;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
 
@@ -17,12 +18,14 @@ public class DependencySecurityCandidatesFinder {
     private final SonatypeScanReport report;
     private final NexusVersionResolver nexusVersionResolver;
     private final LocalProjectAnalyzer localProjectAnalyzer;
+    private final MavenPomFixer mavenPomFixer;
 
 
 
     public DependencySecurityCandidatesFinder(SonatypeScanReport report, RepositorySystem repositorySystem, RepositorySystemSession repository, NexusCredentials credentials) {
         this.report = report;
         this.nexusVersionResolver = new NexusVersionResolver(repositorySystem, repository, credentials);
+        mavenPomFixer = new MavenPomFixer();
         localProjectAnalyzer = new LocalProjectAnalyzer(repositorySystem, repository, List.of(new RemoteRepository.Builder(
                 "nexus",
                 "default",
@@ -67,8 +70,9 @@ public class DependencySecurityCandidatesFinder {
                     directDependency.getArtifactId(),
                     directDependency.getVersion()
             );
+            newerVersions.sort(Comparator.comparing(i -> i.substring(i.lastIndexOf("."))));
 
-            System.out.println("Кандидати на оновлення: " + newerVersions);
+            mavenPomFixer.updatePomFile(pomFile, directDependency, newerVersions);
         }
 
     }

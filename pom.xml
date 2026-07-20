@@ -68,6 +68,11 @@
             <artifactId>maven-resolver-provider</artifactId>
             <version>3.9.16</version>
         </dependency>
+        <dependency>
+            <groupId>org.openrewrite</groupId>
+            <artifactId>rewrite-maven</artifactId>
+            <version>8.87.4</version>
+        </dependency>
     </dependencies>
 
     <build>
