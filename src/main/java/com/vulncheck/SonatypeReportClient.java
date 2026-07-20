@@ -1,8 +1,7 @@
 package com.vulncheck;
 
-import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import java.io.IOException;
 import java.net.URI;
@@ -11,6 +10,8 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 public final class SonatypeReportClient {
@@ -43,7 +44,7 @@ public final class SonatypeReportClient {
                 );
     }
 
-    public JsonNode fetchReportData(String reportDataUrl) {
+    public String fetchReportData(String reportDataUrl) {
         Objects.requireNonNull(reportDataUrl, "reportDataUrl");
         return executeGet(reportDataUrl);
     }
@@ -61,23 +62,28 @@ public final class SonatypeReportClient {
                 + "/api/v2/applications?publicId="
                 + publicApplicationId;
 
-        JsonNode response = executeGet(url);
-        JsonNode applications = response.get("applications");
+        ApplicationsResponse response;
+        try {
+            response = objectMapper.readValue(executeGet(url), ApplicationsResponse.class);
+        } catch (IOException exception) {
+            throw new IllegalStateException("Cannot deserialize Sonatype applications response", exception);
+        }
+        List<SonatypeApplication> applications = response.applications();
 
-        if (applications == null || applications.isEmpty()) {
+        if (applications.isEmpty()) {
             throw new IllegalStateException(
                     "No application found with publicId: " + publicApplicationId
             );
         }
 
-        JsonNode idNode = applications.get(0).get("id");
-        if (idNode == null) {
+        String applicationId = applications.getFirst().id();
+        if (applicationId == null || applicationId.isBlank()) {
             throw new IllegalStateException(
                     "Application entry has no 'id' field for publicId: " + publicApplicationId
             );
         }
 
-        return idNode.asText();
+        return applicationId;
     }
 
     /**
@@ -89,7 +95,7 @@ public final class SonatypeReportClient {
      * @param scanId                the scan ID from Sonatype scan result
      * @return the remediation JSON response
      */
-    public JsonNode fetchRemediation(
+    public String fetchRemediation(
             String applicationInternalId,
             String packageUrl,
             String scanId
@@ -103,13 +109,10 @@ public final class SonatypeReportClient {
                 + applicationInternalId
                 + "?stageId=build&scanId=" + scanId;
 
-        ObjectNode body = objectMapper.createObjectNode();
-        body.put("packageUrl", packageUrl);
-
-        return executePost(url, body);
+        return executePost(url, Map.of("packageUrl", packageUrl));
     }
 
-    private JsonNode executeGet(String url) {
+    private String executeGet(String url) {
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(url))
                 .header("Accept", "application/json")
@@ -120,7 +123,7 @@ public final class SonatypeReportClient {
         return executeRequest(request);
     }
 
-    private JsonNode executePost(String url, JsonNode body) {
+    private String executePost(String url, Object body) {
         String jsonBody;
         try {
             jsonBody = objectMapper.writeValueAsString(body);
@@ -139,7 +142,7 @@ public final class SonatypeReportClient {
         return executeRequest(request);
     }
 
-    private JsonNode executeRequest(HttpRequest request) {
+    private String executeRequest(HttpRequest request) {
         try {
             HttpResponse<String> response = httpClient.send(
                     request,
@@ -155,7 +158,7 @@ public final class SonatypeReportClient {
                 );
             }
 
-            return objectMapper.readTree(response.body());
+            return response.body();
 
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
@@ -169,5 +172,16 @@ public final class SonatypeReportClient {
                     exception
             );
         }
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private record ApplicationsResponse(List<SonatypeApplication> applications) {
+        private ApplicationsResponse {
+            applications = applications == null ? List.of() : List.copyOf(applications);
+        }
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private record SonatypeApplication(String id) {
     }
 }

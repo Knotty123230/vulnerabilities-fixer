@@ -1,14 +1,13 @@
 package com.vulncheck;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ArrayNode;
-import com.fasterxml.jackson.databind.node.ObjectNode;
 
+import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 
 public class SonatypeProcessor {
     private final SonatypeReportClient sonatypeClient;
@@ -27,147 +26,154 @@ public class SonatypeProcessor {
         this.credentials = credentials;
     }
 
-
-    public void scan(Path pathToProject, String applicationId) {
+    public SonatypeScanReport scan(Path pathToProject, String applicationId) {
         SonatypeScanner.SonatypeScanResult scanResult = sonatypeScanner.scan(pathToProject);
-
-        String reportDataUrl = buildReportDataUrl(
-                credentials.serverUrl(),
-                applicationId,
-                scanResult.scanId()
+        SonatypeReportData reportData = readValue(
+                sonatypeClient.fetchReportData(buildReportDataUrl(
+                        credentials.serverUrl(), applicationId, scanResult.scanId())),
+                SonatypeReportData.class
         );
-        JsonNode reportData = sonatypeClient.fetchReportData(reportDataUrl);
-
-        // Resolve internal application ID for remediation API
         String applicationInternalId = sonatypeClient.resolveApplicationInternalId(applicationId);
+        List<SonatypeScanReport.VulnerabilityDetails> vulnerabilities = new ArrayList<>();
 
-        // Find components with security issues and fetch remediation
-        JsonNode components = reportData.get("components");
-        List<VulnerableComponentResult> vulnerableComponents = new ArrayList<>();
-
-        if (components != null && components.isArray()) {
-            for (JsonNode component : components) {
-                JsonNode securityData = component.get("securityData");
-                if (securityData == null) continue;
-
-                JsonNode securityIssues = securityData.get("securityIssues");
-                if (securityIssues == null || securityIssues.isEmpty()) continue;
-
-                String packageUrl = component.has("packageUrl")
-                        ? component.get("packageUrl").asText()
-                        : null;
-
-                if (packageUrl == null || packageUrl.isBlank()) continue;
-
-                JsonNode remediation = null;
-                try {
-                    remediation = sonatypeClient.fetchRemediation(
-                            applicationInternalId,
-                            packageUrl,
-                            scanResult.scanId()
-                    );
-                } catch (Exception e) {
-                    System.err.println("Warning: could not fetch remediation for "
-                            + packageUrl + ": " + e.getMessage());
-                }
-
-                vulnerableComponents.add(new VulnerableComponentResult(
-                        component,
-                        remediation
-                ));
+        for (ReportComponent component : reportData.components()) {
+            if (!component.hasSecurityIssues() || component.packageUrl() == null || component.packageUrl().isBlank()) {
+                continue;
             }
+
+            RemediationResponse remediation = fetchRemediation(
+                    applicationInternalId, component.packageUrl(), scanResult.scanId());
+            vulnerabilities.add(toVulnerabilityDetails(component, remediation));
         }
 
-        // Build output
-        ObjectNode output = objectMapper.createObjectNode();
-        output.put("applicationId", applicationId);
-        output.put("scanId", scanResult.scanId());
-        output.put("reportUrl", scanResult.reportHtmlUrl());
-        output.put("totalComponents", components != null ? components.size() : 0);
-        output.put("vulnerableComponents", vulnerableComponents.size());
+        return new SonatypeScanReport(
+                applicationId,
+                scanResult.scanId(),
+                scanResult.reportHtmlUrl(),
+                reportData.components().size(),
+                vulnerabilities.size(),
+                List.copyOf(vulnerabilities)
+        );
+    }
 
-        ArrayNode vulnerabilities = output.putArray("vulnerabilities");
-        for (VulnerableComponentResult vcr : vulnerableComponents) {
-            ObjectNode entry = objectMapper.createObjectNode();
-
-            JsonNode comp = vcr.component();
-            entry.put("packageUrl", comp.get("packageUrl").asText());
-            entry.put("displayName", comp.has("displayName")
-                    ? comp.get("displayName").asText() : "");
-
-            // Copy security issues
-            entry.set("securityIssues", comp.get("securityData").get("securityIssues"));
-
-            // Dependency info
-            JsonNode depData = comp.get("dependencyData");
-            if (depData != null) {
-                entry.put("directDependency", depData.has("directDependency")
-                        && depData.get("directDependency").asBoolean());
-                if (depData.has("parentComponentPurls")) {
-                    entry.set("parentComponentPurls", depData.get("parentComponentPurls"));
-                }
-            }
-
-            // Remediation - extract recommended fix versions
-            if (vcr.remediation() != null) {
-                JsonNode remediationNode = vcr.remediation().get("remediation");
-                if (remediationNode != null && remediationNode.has("versionChanges")) {
-                    ArrayNode fixVersions = objectMapper.createArrayNode();
-                    for (JsonNode versionChange : remediationNode.get("versionChanges")) {
-                        ObjectNode fix = objectMapper.createObjectNode();
-                        fix.put("type", versionChange.has("type")
-                                ? versionChange.get("type").asText() : "unknown");
-
-                        JsonNode data = versionChange.get("data");
-                        if (data != null && data.has("component")) {
-                            JsonNode fixComp = data.get("component");
-                            if (fixComp.has("componentIdentifier")) {
-                                JsonNode coords = fixComp.get("componentIdentifier").get("coordinates");
-                                if (coords != null && coords.has("version")) {
-                                    fix.put("version", coords.get("version").asText());
-                                }
-                            }
-                            if (fixComp.has("packageUrl")) {
-                                fix.put("packageUrl", fixComp.get("packageUrl").asText());
-                            }
-                        }
-
-                        fixVersions.add(fix);
-                    }
-                    entry.set("remediationVersions", fixVersions);
-                }
-            }
-
-            vulnerabilities.add(entry);
-        }
-
+    private RemediationResponse fetchRemediation(String applicationInternalId, String packageUrl, String scanId) {
         try {
-            System.out.println(objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(output));
-        } catch (JsonProcessingException e) {
-            throw new RuntimeException(e);
+            return readValue(
+                    sonatypeClient.fetchRemediation(applicationInternalId, packageUrl, scanId),
+                    RemediationResponse.class
+            );
+        } catch (RuntimeException exception) {
+            return RemediationResponse.EMPTY;
         }
     }
 
-
-    public static String buildReportDataUrl(
-            String serverUrl,
-            String applicationId,
-            String scanId
+    private SonatypeScanReport.VulnerabilityDetails toVulnerabilityDetails(
+            ReportComponent component,
+            RemediationResponse remediation
     ) {
+        DependencyData dependencyData = component.dependencyData();
+        return new SonatypeScanReport.VulnerabilityDetails(
+                component.packageUrl(),
+                Objects.requireNonNullElse(component.displayName(), ""),
+                component.securityData().securityIssues(),
+                dependencyData != null && dependencyData.directDependency(),
+                dependencyData == null ? List.of() : dependencyData.parentComponentPurls(),
+                remediation.remediation().versionChanges().stream()
+                        .map(this::toRemediationVersion)
+                        .toList()
+        );
+    }
+
+    private SonatypeScanReport.RemediationVersion toRemediationVersion(VersionChange versionChange) {
+        RemediationComponent component = versionChange.data() == null ? null : versionChange.data().component();
+        ComponentIdentifier identifier = component == null ? null : component.componentIdentifier();
+        Coordinates coordinates = identifier == null ? null : identifier.coordinates();
+        return new SonatypeScanReport.RemediationVersion(
+                Objects.requireNonNullElse(versionChange.type(), "unknown"),
+                coordinates == null ? null : coordinates.version(),
+                component == null ? null : component.packageUrl()
+        );
+    }
+
+    private <T> T readValue(String json, Class<T> targetType) {
+        try {
+            return objectMapper.readValue(json, targetType);
+        } catch (IOException exception) {
+            throw new IllegalStateException("Cannot deserialize Sonatype response", exception);
+        }
+    }
+
+    public static String buildReportDataUrl(String serverUrl, String applicationId, String scanId) {
         String base = serverUrl.endsWith("/")
                 ? serverUrl.substring(0, serverUrl.length() - 1)
                 : serverUrl;
-
-        return base
-                + "/api/v2/applications/"
-                + applicationId
-                + "/reports/"
-                + scanId;
+        return base + "/api/v2/applications/" + applicationId + "/reports/" + scanId;
     }
 
-    private record VulnerableComponentResult(
-            JsonNode component,
-            JsonNode remediation
-    ) {
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private record SonatypeReportData(List<ReportComponent> components) {
+        private SonatypeReportData {
+            components = components == null ? List.of() : List.copyOf(components);
+        }
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private record ReportComponent(String packageUrl, String displayName, SecurityData securityData,
+                                   DependencyData dependencyData) {
+        private boolean hasSecurityIssues() {
+            return securityData != null && !securityData.securityIssues().isEmpty();
+        }
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private record SecurityData(List<SonatypeScanReport.SecurityIssue> securityIssues) {
+        private SecurityData {
+            securityIssues = securityIssues == null ? List.of() : List.copyOf(securityIssues);
+        }
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private record DependencyData(boolean directDependency, List<String> parentComponentPurls) {
+        private DependencyData {
+            parentComponentPurls = parentComponentPurls == null ? List.of() : List.copyOf(parentComponentPurls);
+        }
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private record RemediationResponse(Remediation remediation) {
+        private static final RemediationResponse EMPTY = new RemediationResponse(Remediation.EMPTY);
+
+        private RemediationResponse {
+            remediation = remediation == null ? Remediation.EMPTY : remediation;
+        }
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private record Remediation(List<VersionChange> versionChanges) {
+        private static final Remediation EMPTY = new Remediation(List.of());
+
+        private Remediation {
+            versionChanges = versionChanges == null ? List.of() : List.copyOf(versionChanges);
+        }
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private record VersionChange(String type, VersionChangeData data) {
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private record VersionChangeData(RemediationComponent component) {
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private record RemediationComponent(ComponentIdentifier componentIdentifier, String packageUrl) {
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private record ComponentIdentifier(Coordinates coordinates) {
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private record Coordinates(String version) {
     }
 }

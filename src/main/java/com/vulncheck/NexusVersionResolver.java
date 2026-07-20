@@ -15,6 +15,7 @@ import org.eclipse.aether.resolution.VersionRangeResult;
 import org.eclipse.aether.util.repository.AuthenticationBuilder;
 import org.eclipse.aether.version.Version;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -23,8 +24,8 @@ public class NexusVersionResolver {
     private final RepositorySystem repositorySystem;
     private final RepositorySystemSession session;
     private final String nexusUrl;
-    private  String nexusUsername;
-    private  String nexusPassword;
+    private final String nexusUsername;
+    private final String nexusPassword;
 
     public NexusVersionResolver(
             RepositorySystem repositorySystem,
@@ -42,6 +43,11 @@ public class NexusVersionResolver {
         this.nexusUsername = Objects.requireNonNull(nexusUsername, "nexusUsername");
         this.nexusPassword = Objects.requireNonNull(nexusPassword, "nexusPassword");
     }
+
+    public NexusVersionResolver(RepositorySystem repositorySystem, RepositorySystemSession repository, NexusCredentials credentials) {
+        this(repositorySystem, repository, credentials.url(), credentials.username(), credentials.password());
+    }
+
 
     public List<String> getAvailableVersions(
             String groupId,

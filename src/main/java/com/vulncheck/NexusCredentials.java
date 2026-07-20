@@ -1,5 +1,8 @@
 package com.vulncheck;
 
+import org.eclipse.aether.repository.Authentication;
+import org.eclipse.aether.util.repository.AuthenticationBuilder;
+
 public record NexusCredentials(String url, String username, String password) {
 
     public NexusCredentials {
@@ -13,5 +16,12 @@ public record NexusCredentials(String url, String username, String password) {
             throw new IllegalArgumentException(fieldName + " must not be blank.");
         }
         return value;
+    }
+
+    public Authentication toAuthentication() {
+        return new AuthenticationBuilder()
+                .addUsername(username)
+                .addPassword(password)
+                .build();
     }
 }

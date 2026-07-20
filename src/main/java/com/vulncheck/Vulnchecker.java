@@ -1,5 +1,7 @@
 package com.vulncheck;
 
+import org.apache.maven.model.building.ModelBuildingException;
+import org.eclipse.aether.collection.DependencyCollectionException;
 import picocli.CommandLine;
 
 import java.nio.file.Path;
@@ -72,28 +74,29 @@ public class Vulnchecker implements Runnable {
         NexusCredentials credentials = resolveNexusCredentials();
 
         var repositorySystem = MavenResolverFactory.createRepositorySystem();
-        NexusVersionResolver nexusVersionResolver = new NexusVersionResolver(repositorySystem, MavenResolverFactory.createSession(repositorySystem, Path.of(
+
+        SonatypeScanReport report = null;
+        if (scanSonatype) {
+            report = new SonatypeProcessor(resolveSonatypeCredentials()).scan(filePath, sonatypeApplicationId);
+        }
+
+        var path = new MavenDependencyTreePluginExecutor().execute(filePath);
+        System.out.println("Dependency tree JSON: " + path);
+
+
+        var dependencySecurityCandidatesFinder = new DependencySecurityCandidatesFinder(report, repositorySystem, MavenResolverFactory.createSession(repositorySystem, Path.of(
                 System.getProperty("user.home"),
                 ".m2",
                 "repository"
         )),
-                credentials.url(),
-                credentials.username(),
-                credentials.password());
-
-        nexusVersionResolver.getNewerVersions("com.fasterxml.jackson.core", "jackson-databind", "2.21.3").forEach(version -> {
-            System.out.println("Newer version available: " + version);
-        });
-
-        if (scanSonatype) {
-            new SonatypeProcessor(resolveSonatypeCredentials()).scan(filePath, sonatypeApplicationId);
+                credentials
+        );
+        try {
+            dependencySecurityCandidatesFinder.findDependencySecurityCandidates(path.resolve("pom.xml").toFile());
+        } catch (DependencyCollectionException | ModelBuildingException e) {
+            System.out.println("Failed to build dependency tree");
+            throw new RuntimeException(e);
         }
-
-//        var path = new MavenDependencyTreePluginExecutor().execute(filePath);
-//        System.out.println("Dependency tree JSON: " + path);
-//        DependencyTreeConverter converter = new DependencyTreeConverter();
-//
-//        DependencyNode dependencyNode = converter.convert(path);
 
 
     }
@@ -129,6 +132,7 @@ public class Vulnchecker implements Runnable {
     private SonatypeCredentials resolveSonatypeCredentials() {
         SonatypeCredentialsStore store = new SonatypeCredentialsStore();
         Optional<SonatypeCredentialsStore.SonatypeSettings> savedSettings = store.loadSettings();
+
 
         String url = firstNonBlank(sonatypeUrl, savedSettings.map(SonatypeCredentialsStore.SonatypeSettings::serverUrl).orElse(null));
         String applicationId = firstNonBlank(
