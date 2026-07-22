@@ -12,20 +12,17 @@ import java.util.regex.Pattern;
 public final class SonatypeScanner {
 
     private static final Pattern REPORT_URL_PATTERN = Pattern.compile(
-            "The detailed report can be viewed at:\\s*(https?://\\S+)"
-    );
+            "The detailed report can be viewed at:\\s*(https?://\\S+)");
 
     private static final Pattern POLICY_ACTION_PATTERN = Pattern.compile(
-            "Policy Action:\\s*(\\S+)"
-    );
+            "Policy Action:\\s*(\\S+)");
 
     private final SonatypeCredentials sonatypeCredentials;
 
     public SonatypeScanner(SonatypeCredentials sonatypeCredentials) {
         this.sonatypeCredentials = Objects.requireNonNull(
                 sonatypeCredentials,
-                "sonatypeCredentials"
-        );
+                "sonatypeCredentials");
     }
 
     public SonatypeScanResult scan(Path pathToProject) {
@@ -33,16 +30,14 @@ public final class SonatypeScanner {
 
         if (!Files.isDirectory(pathToProject)) {
             throw new IllegalArgumentException(
-                    "Path is not a directory: " + pathToProject
-            );
+                    "Path is not a directory: " + pathToProject);
         }
 
         Path pomFile = pathToProject.resolve("pom.xml");
 
         if (!Files.isRegularFile(pomFile)) {
             throw new IllegalArgumentException(
-                    "pom.xml not found: " + pomFile
-            );
+                    "pom.xml not found: " + pomFile);
         }
 
         ProcessBuilder processBuilder = getProcessBuilder(pathToProject);
@@ -55,40 +50,34 @@ public final class SonatypeScanner {
 
             output = new String(
                     process.getInputStream().readAllBytes(),
-                    StandardCharsets.UTF_8
-            );
+                    StandardCharsets.UTF_8);
 
             exitCode = process.waitFor();
 
         } catch (IOException exception) {
             throw new IllegalStateException(
                     "Cannot start Sonatype scan",
-                    exception
-            );
+                    exception);
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
 
             throw new IllegalStateException(
                     "Sonatype scan was interrupted",
-                    exception
-            );
+                    exception);
         }
 
         String reportHtmlUrl = extractRequired(
-                output
-        );
+                output);
 
         String policyAction = extractOptional(
-                output
-        );
+                output);
 
         String scanId = extractScanId(reportHtmlUrl);
 
         ScanStatus status = determineStatus(
                 exitCode,
                 reportHtmlUrl,
-                policyAction
-        );
+                policyAction);
 
         return new SonatypeScanResult(
                 sonatypeCredentials.applicationId(),
@@ -97,8 +86,7 @@ public final class SonatypeScanner {
                 policyAction,
                 status,
                 exitCode,
-                output
-        );
+                output);
     }
 
     private ProcessBuilder getProcessBuilder(Path pathToProject) {
@@ -110,8 +98,7 @@ public final class SonatypeScanner {
                 "-Dclm.username=" + sonatypeCredentials.sonatypeUsername(),
                 "-Dclm.password=" + sonatypeCredentials.sonatypePassword(),
                 "-Dclm.applicationId=" + sonatypeCredentials.applicationId(),
-                "-Dclm.stage=build"
-        );
+                "-Dclm.stage=build");
 
         ProcessBuilder processBuilder = new ProcessBuilder(command);
         processBuilder.directory(pathToProject.toFile());
@@ -119,10 +106,8 @@ public final class SonatypeScanner {
         return processBuilder;
     }
 
-
     private static String extractRequired(
-            String output
-    ) {
+            String output) {
         Matcher matcher = SonatypeScanner.REPORT_URL_PATTERN.matcher(output);
 
         if (!matcher.find()) {
@@ -131,16 +116,14 @@ public final class SonatypeScanner {
                             + System.lineSeparator()
                             + "Maven output:"
                             + System.lineSeparator()
-                            + output
-            );
+                            + output);
         }
 
         return matcher.group(1).trim();
     }
 
     private static String extractOptional(
-            String output
-    ) {
+            String output) {
         Matcher matcher = SonatypeScanner.POLICY_ACTION_PATTERN.matcher(output);
 
         return matcher.find()
@@ -153,13 +136,11 @@ public final class SonatypeScanner {
 
         if (reportIndex < 0) {
             throw new IllegalStateException(
-                    "Cannot extract scan ID from report URL: " + reportUrl
-            );
+                    "Cannot extract scan ID from report URL: " + reportUrl);
         }
 
         String scanId = reportUrl.substring(
-                reportIndex + "/report/".length()
-        );
+                reportIndex + "/report/".length());
 
         int queryIndex = scanId.indexOf('?');
 
@@ -175,8 +156,7 @@ public final class SonatypeScanner {
 
         if (scanId.isBlank()) {
             throw new IllegalStateException(
-                    "Empty scan ID in report URL: " + reportUrl
-            );
+                    "Empty scan ID in report URL: " + reportUrl);
         }
 
         return scanId;
@@ -185,8 +165,7 @@ public final class SonatypeScanner {
     private static ScanStatus determineStatus(
             int exitCode,
             String reportUrl,
-            String policyAction
-    ) {
+            String policyAction) {
         /*
          * Якщо report URL існує, evaluation завершилась.
          * Ненульовий exit code може означати policy failure.
@@ -216,7 +195,6 @@ public final class SonatypeScanner {
             String policyAction,
             ScanStatus status,
             int exitCode,
-            String rawOutput
-    ) {
+            String rawOutput) {
     }
 }

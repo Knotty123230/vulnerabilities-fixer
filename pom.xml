@@ -73,6 +73,11 @@
             <artifactId>rewrite-maven</artifactId>
             <version>8.87.4</version>
         </dependency>
+        <dependency>
+            <groupId>com.google.cloud.tools</groupId>
+            <artifactId>dependencies</artifactId>
+            <version>1.5.15</version>
+        </dependency>
     </dependencies>
 
     <build>

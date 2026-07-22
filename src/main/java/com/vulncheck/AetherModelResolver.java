@@ -91,6 +91,7 @@ public class AetherModelResolver implements ModelResolver {
         VersionRangeRequest rangeRequest = new VersionRangeRequest(artifact, repositories, null);
         VersionRangeResult rangeResult = repositorySystem.resolveVersionRange(session, rangeRequest);
 
+
         if (rangeResult.getHighestVersion() == null) {
             throw new UnresolvableModelException(
                     "No versions matched the requested range '" + version + "'",
