@@ -22,10 +22,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class LinkageAnalyzerIT {
 
     private LocalProjectAnalyzer analyzer() {
-        var system = MavenResolverFactory.createRepositorySystem();
-        var session = MavenResolverFactory.createSession(
-                system, MavenResolverFactory.defaultLocalRepository(), null);
-        return new LocalProjectAnalyzer(system, session, MavenResolverFactory.createRepositories(null));
+        return TestRepositories.requireReachableRepository().analyzer();
     }
 
     @Test

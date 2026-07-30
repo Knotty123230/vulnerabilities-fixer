@@ -34,6 +34,7 @@ public final class MarkdownReportRenderer {
 
         appendFixedSection(md, report);
         appendOutstandingSection(md, report);
+        appendFamilySkewSection(md, report);
         appendNotReachableSection(md, report);
 
         md.append("\n---\n");
@@ -119,6 +120,28 @@ public final class MarkdownReportRenderer {
                 .reduce((a, b) -> a + ", " + b)
                 .orElse("—"));
         md.append('\n');
+    }
+
+    private static void appendFamilySkewSection(StringBuilder md, ScanReport report) {
+        List<ScanReport.FamilySkew> skews = report.familySkews();
+        if (skews == null || skews.isEmpty()) {
+            return;
+        }
+        md.append("## Mixed versions (").append(skews.size()).append(")\n\n");
+        md.append("These artifacts ship as a set but resolved at different versions, which risks ")
+                .append("`NoSuchMethodError` at runtime even without a CVE.\n\n");
+
+        md.append("| Family | Resolved versions | Suggested fix |\n|---|---|---|\n");
+        for (ScanReport.FamilySkew skew : skews) {
+            md.append("| ").append(code(skew.groupId()))
+                    .append(" | ").append(code(String.join(", ", skew.versions())))
+                    .append(" | ")
+                    .append(skew.bomCoordinate() == null
+                            ? "—"
+                            : "import " + code(skew.bomCoordinate() + ":" + skew.suggestedBomVersion()))
+                    .append(" |\n");
+        }
+        md.append("\nRe-run with `--align-families` to apply the BOM imports.\n\n");
     }
 
     private static void appendNotReachableSection(StringBuilder md, ScanReport report) {

@@ -9,6 +9,7 @@ import org.eclipse.aether.supplier.RepositorySystemSupplier;
 import org.eclipse.aether.supplier.SessionBuilderSupplier;
 
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 
 /** Wiring for Maven Resolver: one repository system, one session, one repository list. */
@@ -27,34 +28,31 @@ public final class MavenResolverFactory {
         return Path.of(System.getProperty("user.home"), ".m2", "repository");
     }
 
-    /**
-     * The repositories artifacts are looked up in: the configured Nexus, or Maven Central when
-     * there is none.
-     */
-    public static List<RemoteRepository> createRepositories(NexusCredentials credentials) {
-        if (credentials == null) {
-            return List.of(new RemoteRepository.Builder("central", "default", CENTRAL_URL).build());
-        }
-        return List.of(new RemoteRepository.Builder("nexus", "default", credentials.url())
-                .setAuthentication(credentials.toAuthentication())
-                .build());
+    public static RepositorySystemSession createSession(RepositorySystem repositorySystem, Path localRepositoryPath) {
+        return createSession(repositorySystem, localRepositoryPath, null, null);
     }
 
-    public static RepositorySystemSession createSession(RepositorySystem repositorySystem, Path localRepositoryPath) {
-        return createSession(repositorySystem, localRepositoryPath, null);
+    public static RepositorySystemSession createSession(RepositorySystem repositorySystem,
+                                                        Path localRepositoryPath,
+                                                        NexusCredentials nexusCredentials) {
+        return createSession(repositorySystem, localRepositoryPath, nexusCredentials, null);
     }
 
     /**
      * Builds the resolution session.
      *
-     * <p>When a Nexus is configured, every other repository is mirrored through it. Transitive
-     * POMs frequently declare their own {@code <repositories>}, and Aether's descriptor reader
-     * would otherwise reach straight out to them — which fails on a corporate network that only
-     * allows the internal mirror, and quietly bypasses that mirror on one that does not.
+     * <p>Configuration precedence is: an explicit {@code --nexus-url} wins, otherwise the user's
+     * {@code settings.xml} applies, otherwise plain Central. An explicit Nexus mirrors <em>every</em>
+     * repository, including those declared inside transitive POMs — Aether's descriptor reader
+     * would otherwise reach straight out to them, which fails on a network that only allows the
+     * internal mirror and quietly bypasses that mirror on one that does not.
+     *
+     * @param settings the user's Maven settings, or {@code null} to ignore them
      */
     public static RepositorySystemSession createSession(RepositorySystem repositorySystem,
                                                         Path localRepositoryPath,
-                                                        NexusCredentials nexusCredentials) {
+                                                        NexusCredentials nexusCredentials,
+                                                        MavenUserSettings settings) {
         // Must come from SessionBuilderSupplier, which ships with the same resolver version as
         // the RepositorySystem above. The older MavenRepositorySystemUtils.newSession() from
         // maven-resolver-provider is built against the resolver 1.9 API: it produces a session
@@ -67,15 +65,54 @@ public final class MavenResolverFactory {
         builder.setUpdatePolicy(RepositoryPolicy.UPDATE_POLICY_DAILY);
         // A security tool must not silently accept a corrupted artifact; warn rather than ignore.
         builder.setChecksumPolicy(RepositoryPolicy.CHECKSUM_POLICY_WARN);
-        builder.setOffline(false);
         builder.setSystemProperties(System.getProperties());
+        builder.setOffline(settings != null && settings.isOffline());
         builder.withLocalRepositoryBaseDirectories(localRepositoryPath);
 
         if (nexusCredentials != null) {
             builder.setMirrorSelector(mirrorEverythingThrough(nexusCredentials));
+        } else if (settings != null) {
+            builder.setMirrorSelector(settings.mirrorSelector());
+            builder.setProxySelector(settings.proxySelector());
+            builder.setAuthenticationSelector(settings.authenticationSelector());
         }
 
         return builder.build();
+    }
+
+    public static List<RemoteRepository> createRepositories(NexusCredentials credentials) {
+        return createRepositories(null, null, credentials, null);
+    }
+
+    /**
+     * The repositories artifacts are looked up in.
+     *
+     * <p>The result is passed through {@link RepositorySystem#newResolutionRepositories} whenever a
+     * session is available. That call is what actually applies the session's mirror, proxy and
+     * authentication selectors to each repository — build the list by hand and skip it, and a
+     * perfectly configured {@code settings.xml} has no effect whatsoever.
+     */
+    public static List<RemoteRepository> createRepositories(RepositorySystem repositorySystem,
+                                                            RepositorySystemSession session,
+                                                            NexusCredentials credentials,
+                                                            MavenUserSettings settings) {
+        List<RemoteRepository> repositories = new ArrayList<>();
+
+        if (credentials != null) {
+            repositories.add(new RemoteRepository.Builder("nexus", "default", credentials.url())
+                    .setAuthentication(credentials.toAuthentication())
+                    .build());
+        } else {
+            repositories.add(new RemoteRepository.Builder("central", "default", CENTRAL_URL).build());
+            if (settings != null) {
+                repositories.addAll(settings.activeProfileRepositories());
+            }
+        }
+
+        if (repositorySystem == null || session == null) {
+            return List.copyOf(repositories);
+        }
+        return List.copyOf(repositorySystem.newResolutionRepositories(session, repositories));
     }
 
     private static MirrorSelector mirrorEverythingThrough(NexusCredentials credentials) {

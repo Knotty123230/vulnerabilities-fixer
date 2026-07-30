@@ -26,8 +26,26 @@ public record ScanReport(
         boolean dryRun,
         String upgradeScope,
         int componentsScanned,
-        List<Finding> findings
+        List<Finding> findings,
+        List<FamilySkew> familySkews
 ) {
+
+    /**
+     * A group of artifacts that ship as a unit but resolved at more than one version.
+     *
+     * <p>Reported independently of any vulnerability: skew is a latent
+     * {@code NoSuchMethodError} whether or not a CVE happens to point at it today.
+     */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public record FamilySkew(
+            String groupId,
+            List<String> versions,
+            Map<String, String> resolvedArtifacts,
+            String bomCoordinate,
+            String suggestedBomVersion,
+            boolean aligned
+    ) {
+    }
 
     /** What the tool managed to do about one vulnerable component. */
     public enum Outcome {

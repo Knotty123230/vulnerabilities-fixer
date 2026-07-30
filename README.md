@@ -40,7 +40,12 @@ mvn clean package          # produces target/vulnerabilities-fixer-1.0-SNAPSHOT.
 mvn test -Dtest.excludedGroups=network   # unit tests only, no network
 ```
 
-Requires JDK 21+.
+Requires JDK 21+. Always build with `clean`: an IDE building into the same `target/` with a
+different JDK leaves class files Maven will not overwrite.
+
+Tests tagged `network` resolve real artifacts through this machine's `settings.xml`. If the
+repository is unreachable they are **skipped**, not failed — an offline machine is not a
+regression. Exclude them entirely with `-Dtest.excludedGroups=network`.
 
 ## Usage
 
@@ -60,6 +65,7 @@ reports exactly what it would change without touching a file.
 | `--upgrade-scope PATCH\|MINOR\|MAJOR` | `MINOR` | How far a version may move |
 | `--fail-on CRITICAL\|HIGH\|MEDIUM\|LOW\|NONE` | `HIGH` | Severity that makes the gate fail |
 | `--check-linkage` | off | Also verify binary compatibility (see below) |
+| `--align-families` | off | Allow importing a family BOM to fix mixed versions (see below) |
 | `--report-format MARKDOWN\|JSON` | `MARKDOWN` | Format for `--report-file` |
 | `--report-file FILE` | — | Write the report to a file as well |
 | `--max-candidates N` | `12` | Cap on versions tried per strategy |
@@ -97,6 +103,64 @@ That is `log₂(n)` graph resolutions instead of `n`, and a smaller diff.
 Groups that ship as a coordinated set (`ch.qos.logback`, `org.slf4j`, `com.fasterxml.jackson.*`,
 `org.springframework`, `io.netty`) are upgraded with a wildcard artifact so the whole set moves
 together — mixing versions inside them is a classic source of `NoSuchMethodError`.
+
+### Mixed versions and family BOMs (`--align-families`)
+
+Artifacts that ship as a set — `io.netty:netty-buffer` and `io.netty:netty-codec`, the Jackson
+modules, gRPC — must resolve at one version. When they drift apart the build stays green and the
+first call that crosses the boundary throws `NoSuchMethodError` in production. Bumping only the
+declared dependency does not fix this: family members pulled in transitively stay behind.
+
+**Detection always runs** and is reported in its own section:
+
+```
+MIXED VERSIONS (1)
+  ! io.netty 4.1.100.Final, 4.1.110.Final
+          netty-buffer:4.1.100.Final
+          netty-codec:4.1.110.Final
+          netty-common:4.1.100.Final
+      fix import io.netty:netty-bom:4.1.110.Final to pin the whole family
+          re-run with --align-families to apply
+```
+
+A "family" is defined by its BOM, not by groupId. Grouping by groupId alone would flag
+`org.apache.commons:commons-lang3:3.12.0` alongside `commons-text:1.10.0`, which are supposed to
+differ. Instead a group is only treated as lockstep when a published BOM pins all of its artifacts
+to *the same* version. The BOM is found by naming convention plus a small curated table
+(Jackson's BOM lives under a different groupId than its artifacts), then **verified by reading its
+descriptor** — `ch.qos.logback` publishes `logback-parent`, which a convention-only guess would
+wrongly adopt.
+
+With `--align-families`, a fix that touches an already-skewed family imports the BOM and strips the
+now-redundant versions:
+
+```xml
+<dependencyManagement>
+  <dependencies>
+    <dependency>
+      <groupId>io.netty</groupId><artifactId>netty-bom</artifactId>
+      <version>4.1.118.Final</version><type>pom</type><scope>import</scope>
+    </dependency>
+  </dependencies>
+</dependencyManagement>
+```
+
+Off by default, and deliberately conditional on observed skew, because the import lands in the
+current POM's `dependencyManagement` — which outranks any inherited BOM. In a Spring Boot project
+that silently detaches the family from the Boot BOM, and the next Boot upgrade drags a stale pin
+along.
+
+Two caveats worth knowing. A BOM does not guarantee full coverage: `netty-bom` has historically
+omitted the `netty-transport-native-*` artifacts ([netty#6738](https://github.com/netty/netty/issues/6738)),
+which is why alignment is confirmed by re-resolving rather than by trusting the edit. And a version
+driven by a `<property>` leaves the property behind after its `<version>` is removed
+([openrewrite#4350](https://github.com/openrewrite/rewrite/issues/4350)) — cosmetic, but visible in
+the diff.
+
+To gate on this in CI independently of the fixer, Maven Enforcer's
+[`dependencyConvergence`](https://maven.apache.org/enforcer/enforcer-rules/dependencyConvergence.html)
+and [`requireUpperBoundDeps`](https://maven.apache.org/enforcer/enforcer-rules/requireUpperBoundDeps.html)
+rules cover the same ground and are usually enabled together.
 
 ### Binary compatibility (`--check-linkage`)
 
@@ -162,6 +226,28 @@ versions tried, and the reason a finding is outstanding.
 
 ## Configuration
 
+### Repositories
+
+By default the tool reads `~/.m2/settings.xml` (and the installation-wide `conf/settings.xml`) and
+honours its **mirrors, proxies, server credentials, `localRepository` and offline flag**. The rule
+is: *if `mvn` can resolve it on this machine, so can the tool.* Encrypted `{...}` passwords are
+decrypted via `~/.m2/settings-security.xml`.
+
+This matters most on locked-down networks. Without it, a machine whose `settings.xml` mirrors
+everything to an internal Nexus would see the tool hang or fail against
+`repo.maven.apache.org` — while `mvn` built the same project fine.
+
+Precedence:
+
+1. `--nexus-url` — explicit override; mirrors **all** repositories through it, including those
+   declared inside transitive POMs, so a locked-down network never sees a direct outbound request.
+2. `~/.m2/settings.xml` — mirrors, proxies, credentials, active-profile repositories.
+3. Maven Central.
+
+Use `--ignore-maven-settings` to skip step 2 (useful for reproducing a clean-machine resolution).
+
+### Credentials
+
 Settings are resolved from **flags → environment → saved settings**, so a pipeline only needs
 secrets in the environment.
 
@@ -173,10 +259,6 @@ secrets in the environment.
 `--save-nexus-credentials` / `--save-sonatype-credentials` persist the non-secret settings to
 `~/.vulnchecker` and the password to the macOS Keychain — a convenience for local use. On other
 platforms the Keychain is simply skipped and the password is read from the environment.
-
-Without a Nexus URL the tool resolves against Maven Central. With one, **all** repositories are
-mirrored through it, including those declared inside transitive POMs, so a locked-down corporate
-network never sees a direct outbound request.
 
 ## Limitations
 

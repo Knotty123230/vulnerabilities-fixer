@@ -22,7 +22,41 @@ public final class ConsoleReportRenderer {
         renderGroup("RESOLVED", report.findings().stream().filter(f -> f.outcome().isResolved()).toList(), true);
         renderGroup("OUTSTANDING", report.outstanding(), false);
         renderInformational(report);
+        renderFamilySkew(report);
         renderSummary(report);
+    }
+
+    /**
+     * Mixed-version artifact families. Reported separately from vulnerabilities because it is a
+     * different kind of defect — a latent {@code NoSuchMethodError} rather than a known CVE.
+     */
+    private static void renderFamilySkew(ScanReport report) {
+        List<ScanReport.FamilySkew> skews = report.familySkews();
+        if (skews == null || skews.isEmpty()) {
+            return;
+        }
+        Log.report("");
+        Log.report(Log.yellow(Log.bold("MIXED VERSIONS (" + skews.size() + ")")));
+        Log.report(Log.dim("  These artifacts ship as a set but resolved at different versions."));
+
+        for (ScanReport.FamilySkew skew : skews) {
+            Log.report("  %s %s %s",
+                    Log.yellow("!"),
+                    Log.bold(skew.groupId()),
+                    Log.dim(String.join(", ", skew.versions())));
+
+            skew.resolvedArtifacts().entrySet().stream()
+                    .sorted(java.util.Map.Entry.comparingByKey())
+                    .limit(Log.isVerbose() ? Integer.MAX_VALUE : 6)
+                    .forEach(entry -> Log.report("      %s %s:%s",
+                            Log.dim("   "), entry.getKey(), entry.getValue()));
+
+            if (skew.bomCoordinate() != null) {
+                Log.report("      %s import %s:%s to pin the whole family",
+                        Log.cyan("fix"), skew.bomCoordinate(), skew.suggestedBomVersion());
+                Log.report("      %s %s", Log.dim("   "), Log.dim("re-run with --align-families to apply"));
+            }
+        }
     }
 
     private static void renderHeader(ScanReport report) {

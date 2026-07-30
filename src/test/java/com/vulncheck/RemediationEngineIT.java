@@ -67,12 +67,9 @@ class RemediationEngineIT {
 
     private ScanReport run(Path projectDir, SonatypeScanReport scan, RemediationEngine.Options options)
             throws Exception {
-        RepositorySystem system = MavenResolverFactory.createRepositorySystem();
-        RepositorySystemSession session =
-                MavenResolverFactory.createSession(system, MavenResolverFactory.defaultLocalRepository(), null);
-        List<RemoteRepository> repositories = MavenResolverFactory.createRepositories(null);
-
-        return new RemediationEngine(scan, system, session, repositories, null, projectDir, options)
+        TestRepositories.Wiring wiring = TestRepositories.requireReachableRepository();
+        return new RemediationEngine(scan, wiring.system(), wiring.session(), wiring.repositories(),
+                null, projectDir, options)
                 .run(projectDir.resolve("pom.xml").toFile());
     }
 
@@ -85,7 +82,7 @@ class RemediationEngineIT {
 
         ScanReport report = run(projectDir,
                 reportFor("org.apache.commons", "commons-text", "1.9", "1.10.0"),
-                new RemediationEngine.Options(VersionPolicy.UpgradeScope.MINOR, false, false, 12));
+                new RemediationEngine.Options(VersionPolicy.UpgradeScope.MINOR, false, false, 12, false));
 
         ScanReport.Finding finding = report.findings().getFirst();
         assertEquals(ScanReport.Outcome.FIXED, finding.outcome(), () -> finding.notes().toString());
@@ -107,7 +104,7 @@ class RemediationEngineIT {
 
         ScanReport report = run(projectDir,
                 reportFor("org.apache.commons", "commons-text", "1.9", "1.10.0"),
-                new RemediationEngine.Options(VersionPolicy.UpgradeScope.MINOR, true, false, 12));
+                new RemediationEngine.Options(VersionPolicy.UpgradeScope.MINOR, true, false, 12, false));
 
         assertEquals(ScanReport.Outcome.WOULD_FIX, report.findings().getFirst().outcome());
         assertEquals(original, Files.readString(pom), "dry run must not modify the POM");
@@ -122,7 +119,7 @@ class RemediationEngineIT {
 
         ScanReport report = run(projectDir,
                 reportFor("com.example", "never-declared", "1.0", "2.0"),
-                new RemediationEngine.Options(VersionPolicy.UpgradeScope.MINOR, true, false, 12));
+                new RemediationEngine.Options(VersionPolicy.UpgradeScope.MINOR, true, false, 12, false));
 
         assertEquals(ScanReport.Outcome.NOT_IN_GRAPH, report.findings().getFirst().outcome());
     }
@@ -135,7 +132,7 @@ class RemediationEngineIT {
 
         ScanReport report = run(projectDir,
                 reportFor("org.apache.commons", "commons-text", "1.9", "1.10.0"),
-                new RemediationEngine.Options(VersionPolicy.UpgradeScope.MINOR, true, false, 12));
+                new RemediationEngine.Options(VersionPolicy.UpgradeScope.MINOR, true, false, 12, false));
 
         ScanReport.Finding finding = report.findings().getFirst();
         assertEquals(ScanReport.Outcome.NOT_AFFECTED, finding.outcome());
@@ -152,7 +149,7 @@ class RemediationEngineIT {
 
         ScanReport report = run(projectDir,
                 reportFor("org.apache.commons", "commons-text", "1.8", "1.10.0"),
-                new RemediationEngine.Options(VersionPolicy.UpgradeScope.MINOR, false, false, 12));
+                new RemediationEngine.Options(VersionPolicy.UpgradeScope.MINOR, false, false, 12, false));
 
         ScanReport.Finding finding = report.findings().getFirst();
         assertEquals(ScanReport.Outcome.FIXED, finding.outcome(), () -> finding.notes().toString());
@@ -176,7 +173,7 @@ class RemediationEngineIT {
 
         ScanReport report = run(projectDir,
                 reportFor("commons-codec", "commons-codec", "1.11", "1.13"),
-                new RemediationEngine.Options(VersionPolicy.UpgradeScope.MINOR, false, false, 12));
+                new RemediationEngine.Options(VersionPolicy.UpgradeScope.MINOR, false, false, 12, false));
 
         ScanReport.Finding finding = report.findings().getFirst();
         assertEquals(ScanReport.Outcome.FIXED, finding.outcome(), () -> finding.notes().toString());
@@ -200,7 +197,7 @@ class RemediationEngineIT {
 
         ScanReport report = run(projectDir,
                 reportFor("org.apache.commons", "commons-text", "1.8", "1.10.0"),
-                new RemediationEngine.Options(VersionPolicy.UpgradeScope.PATCH, false, false, 12));
+                new RemediationEngine.Options(VersionPolicy.UpgradeScope.PATCH, false, false, 12, false));
 
         ScanReport.Finding finding = report.findings().getFirst();
         assertEquals(ScanReport.Outcome.NO_WORKING_FIX, finding.outcome());
@@ -213,11 +210,7 @@ class RemediationEngineIT {
     /** Independently re-resolves the project and asserts the vulnerability is genuinely gone. */
     private void assertNoAffectedVersionRemains(Path projectDir, String groupId, String artifactId,
                                                 String vulnerableVersion, List<String> fixes) throws Exception {
-        RepositorySystem system = MavenResolverFactory.createRepositorySystem();
-        RepositorySystemSession session =
-                MavenResolverFactory.createSession(system, MavenResolverFactory.defaultLocalRepository(), null);
-        LocalProjectAnalyzer analyzer =
-                new LocalProjectAnalyzer(system, session, MavenResolverFactory.createRepositories(null));
+        LocalProjectAnalyzer analyzer = TestRepositories.create().analyzer();
 
         File pom = projectDir.resolve("pom.xml").toFile();
         String resolved = analyzer.resolvedVersionOf(analyzer.buildGraphFromPom(pom), groupId, artifactId);

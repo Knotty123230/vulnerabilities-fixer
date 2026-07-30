@@ -35,10 +35,11 @@ public class RemediationEngine {
             VersionPolicy.UpgradeScope upgradeScope,
             boolean dryRun,
             boolean checkLinkage,
-            int maxAttemptsPerStrategy
+            int maxAttemptsPerStrategy,
+            boolean alignFamilies
     ) {
         public static Options defaults() {
-            return new Options(VersionPolicy.UpgradeScope.MINOR, false, false, 12);
+            return new Options(VersionPolicy.UpgradeScope.MINOR, false, false, 12, false);
         }
     }
 
@@ -60,6 +61,8 @@ public class RemediationEngine {
     private final VersionCatalog versionCatalog;
     private final MavenPomFixer pomFixer;
     private final LinkageAnalyzer linkageAnalyzer;
+    private final BomLocator bomLocator;
+    private final VersionSkewDetector skewDetector;
     private final Path projectPath;
     private final Options options;
 
@@ -77,6 +80,8 @@ public class RemediationEngine {
         this.versionCatalog = new VersionCatalog(repositorySystem, session, repositories);
         this.pomFixer = new MavenPomFixer(credentials);
         this.linkageAnalyzer = new LinkageAnalyzer(analyzer, projectPath);
+        this.bomLocator = new BomLocator(repositorySystem, session, repositories, versionCatalog);
+        this.skewDetector = new VersionSkewDetector(bomLocator);
     }
 
     // ------------------------------------------------------------------
@@ -121,6 +126,14 @@ public class RemediationEngine {
             }
         }
 
+        // Skew is assessed on the final graph, so a family that the fixes happened to align
+        // is not reported as an outstanding problem.
+        Log.section("Checking for version skew");
+        List<ScanReport.FamilySkew> skews = detectSkew(graph);
+        Log.step(skews.isEmpty()
+                ? "No mixed-version artifact families found."
+                : skews.size() + " artifact family/families resolve at mixed versions.");
+
         return new ScanReport(
                 projectPath.toAbsolutePath().normalize().toString(),
                 report.applicationId(),
@@ -130,7 +143,29 @@ public class RemediationEngine {
                 options.dryRun(),
                 options.upgradeScope().describe(),
                 report.totalComponents(),
-                List.copyOf(findings));
+                List.copyOf(findings),
+                skews);
+    }
+
+    /**
+     * Reports mixed-version families. Detection always runs — knowing a family has drifted is
+     * useful whether or not the tool is allowed to restructure the POM to fix it.
+     */
+    private List<ScanReport.FamilySkew> detectSkew(DependencyNode graph) {
+        try {
+            return skewDetector.detect(graph).stream()
+                    .map(skew -> new ScanReport.FamilySkew(
+                            skew.groupId(),
+                            skew.distinctVersions(),
+                            skew.resolvedArtifacts(),
+                            skew.bomCoordinate(),
+                            skew.bom() == null ? null : skew.bom().version(),
+                            false))
+                    .toList();
+        } catch (Exception e) {
+            Log.debug("Version-skew detection failed: %s", Log.describe(e));
+            return List.of();
+        }
     }
 
     /** One-glance status for the progress line, so a long run is never silently opaque. */
@@ -188,7 +223,7 @@ public class RemediationEngine {
             linkageAnalyzer.establishBaseline(graph, vulnerability.groupId(), vulnerability.artifactId());
         }
 
-        List<Strategy> strategies = buildStrategies(pomFile, paths, vulnerability, resolvedVersion);
+        List<Strategy> strategies = buildStrategies(pomFile, graph, paths, vulnerability, resolvedVersion);
         builder.controlPoint(strategies.isEmpty() ? "none found" : strategies.getFirst().name());
 
         Set<String> attempted = new LinkedHashSet<>();
@@ -296,12 +331,18 @@ public class RemediationEngine {
      * exactly why it must not be the first answer: it silently diverges the project from its BOM.
      */
     private List<Strategy> buildStrategies(File pomFile,
+                                           DependencyNode graph,
                                            List<LocalProjectAnalyzer.GraphPath> paths,
                                            Vulnerability vulnerability,
                                            String resolvedVersion) throws Exception {
         List<Strategy> strategies = new ArrayList<>();
         Artifact directDependency = paths.getFirst().directDependency();
         boolean vulnerableIsDirect = paths.getFirst().isDirect();
+
+        // When the vulnerable artifact belongs to a family that has already drifted apart,
+        // importing its BOM is the correct fix rather than a heavier alternative: it clears the
+        // vulnerability and removes the skew that would otherwise cause the next one.
+        addFamilyAlignmentStrategy(pomFile, strategies, graph, vulnerability, resolvedVersion);
 
         LocalProjectAnalyzer.UpdateStrategy controlPoint = analyzer.determineUpdateStrategy(
                 pomFile, directDependency.getGroupId(), directDependency.getArtifactId());
@@ -349,6 +390,66 @@ public class RemediationEngine {
         return strategies;
     }
 
+    /**
+     * Adds the "import the family BOM" strategy, when {@code --align-families} is on and the
+     * vulnerable artifact's family has actually drifted.
+     *
+     * <p>Deliberately conditional on observed skew. Importing a BOM into a POM whose family is
+     * already consistent buys nothing and carries real cost: the import lands in the current POM's
+     * {@code dependencyManagement}, which outranks any inherited BOM, so it quietly detaches the
+     * project from — say — the Spring Boot BOM that was managing that family perfectly well.
+     */
+    private void addFamilyAlignmentStrategy(File pomFile, List<Strategy> strategies, DependencyNode graph,
+                                            Vulnerability vulnerability, String resolvedVersion) {
+        if (!options.alignFamilies()) {
+            return;
+        }
+        Optional<VersionSkewDetector.Skew> skew = skewDetector.detect(graph).stream()
+                .filter(candidate -> candidate.groupId().equals(vulnerability.groupId()))
+                .findFirst();
+        if (skew.isEmpty()) {
+            return;
+        }
+
+        BomLocator.Bom bom = skew.get().bom();
+        // Two constraints on the floor. The family must not be moved backwards, so it is at least
+        // the highest version any member already resolves to; and the import has to clear the
+        // vulnerability, so it is also at least the lowest remediated version. Starting the search
+        // here means the smallest candidate is already a valid answer, and the binary search below
+        // converges on the minimal bump rather than an arbitrary later one.
+        String floor = highestOf(skew.get().highestVersion(), lowestRemediation(vulnerability));
+        List<String> candidates = bomLocator.upgradeCandidates(bom, floor, options.upgradeScope());
+        if (candidates.isEmpty()) {
+            Log.debug("No %s version at or above %s within policy", bom.coordinate(), floor);
+            return;
+        }
+
+        Log.debug("Family %s is skewed %s; trying BOM %s",
+                skew.get().groupId(), skew.get().distinctVersions(), bom.coordinate());
+
+        // Displayed as a move from where the family actually sits today, not from the computed
+        // search floor — "4.1.110.Final -> 4.1.118.Final" is the change a reviewer sees.
+        strategies.addFirst(new Strategy("family BOM import", bom.coordinate(),
+                skew.get().highestVersion(), cap(candidates),
+                version -> pomFixer.previewBomImport(
+                        pomFile, bom.groupId(), bom.artifactId(), version, vulnerability.groupId())));
+    }
+
+    /** The lowest version the scanner considers remediated, or {@code null} when it offers none. */
+    private static String lowestRemediation(Vulnerability vulnerability) {
+        return vulnerability.versionToFix().isEmpty() ? null : vulnerability.versionToFix().getFirst();
+    }
+
+    private static String highestOf(String left, String right) {
+        if (left == null) {
+            return right;
+        }
+        if (right == null) {
+            return left;
+        }
+        return VersionPolicy.compare(left, right) >= 0 ? left : right;
+    }
+
     private void addBomStrategy(File pomFile, List<Strategy> strategies,
                                 Artifact directDependency, Vulnerability vulnerability) throws Exception {
         org.apache.maven.model.Dependency bom = analyzer.findBomManagingDependency(pomFile, directDependency);
@@ -394,13 +495,37 @@ public class RemediationEngine {
         return artifact.getGroupId() + ":" + artifact.getArtifactId();
     }
 
-    /** Bounds how many versions of one artifact a run will resolve graphs for. */
+    /**
+     * Bounds how many versions of one artifact a run will resolve graphs for, by sampling the
+     * candidate range evenly.
+     *
+     * <p>Keeping only the newest N looks reasonable and is not: the search below hunts for the
+     * <em>smallest</em> sufficient bump, so discarding the low end guarantees it cannot find one.
+     * A busy project like Netty publishes dozens of patches between two minors, and truncating to
+     * the tail turned a one-patch fix into a minor-version jump.
+     *
+     * <p>Even sampling keeps the first and last candidate and spreads the rest, so the result is
+     * at worst one sampling step above the true minimum instead of arbitrarily far above it.
+     */
     private List<String> cap(List<String> candidates) {
-        if (candidates.size() <= options.maxAttemptsPerStrategy()) {
+        int limit = options.maxAttemptsPerStrategy();
+        if (candidates.size() <= limit) {
             return candidates;
         }
-        // Keep the newest ones: a fix released recently is far more likely to be in them.
-        return candidates.subList(candidates.size() - options.maxAttemptsPerStrategy(), candidates.size());
+        if (limit == 1) {
+            return List.of(candidates.getLast());
+        }
+
+        List<String> sampled = new ArrayList<>(limit);
+        // Distribute limit picks across [0, size-1] inclusive of both ends.
+        for (int i = 0; i < limit; i++) {
+            int index = (int) Math.round((double) i * (candidates.size() - 1) / (limit - 1));
+            String candidate = candidates.get(index);
+            if (sampled.isEmpty() || !sampled.getLast().equals(candidate)) {
+                sampled.add(candidate);
+            }
+        }
+        return List.copyOf(sampled);
     }
 
     // ------------------------------------------------------------------

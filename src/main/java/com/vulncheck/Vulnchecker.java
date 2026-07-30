@@ -92,6 +92,14 @@ public class Vulnchecker implements Callable<Integer> {
     private boolean checkLinkage;
 
     @CommandLine.Option(
+            names = "--align-families",
+            description = "When a fix touches an artifact family that already resolves at mixed "
+                    + "versions (e.g. io.netty), import the family BOM to pin them all. Mixed "
+                    + "versions are reported either way; this flag allows the POM restructuring. "
+                    + "Off by default because the import outranks any inherited BOM.")
+    private boolean alignFamilies;
+
+    @CommandLine.Option(
             names = "--max-candidates",
             paramLabel = "N",
             defaultValue = "12",
@@ -137,7 +145,17 @@ public class Vulnchecker implements Callable<Integer> {
 
     // ---------------- Nexus ----------------
 
-    @CommandLine.Option(names = "--nexus-url", description = "Nexus repository URL. Omitted: Maven Central.")
+    @CommandLine.Option(
+            names = "--ignore-maven-settings",
+            description = "Do not read ~/.m2/settings.xml. By default its mirrors, proxies, "
+                    + "server credentials and localRepository are used, so the tool resolves "
+                    + "exactly like `mvn` does on this machine.")
+    private boolean ignoreMavenSettings;
+
+    @CommandLine.Option(
+            names = "--nexus-url",
+            description = "Nexus repository URL. Overrides settings.xml. Omitted: settings.xml, "
+                    + "then Maven Central.")
     private String nexusUrl;
 
     @CommandLine.Option(names = "--nexus-username", description = "Nexus username.")
@@ -252,16 +270,26 @@ public class Vulnchecker implements Callable<Integer> {
 
     private ScanReport remediate(File pomFile, NexusCredentials credentials, SonatypeScanReport scanReport)
             throws Exception {
+        MavenUserSettings settings = ignoreMavenSettings ? null : MavenUserSettings.load();
+
         RepositorySystem repositorySystem = MavenResolverFactory.createRepositorySystem();
-        RepositorySystemSession session = MavenResolverFactory.createSession(
-                repositorySystem, MavenResolverFactory.defaultLocalRepository(), credentials);
-        List<RemoteRepository> repositories = MavenResolverFactory.createRepositories(credentials);
+        Path localRepository = settings == null
+                ? MavenResolverFactory.defaultLocalRepository()
+                : settings.localRepository();
+        RepositorySystemSession session =
+                MavenResolverFactory.createSession(repositorySystem, localRepository, credentials, settings);
+        List<RemoteRepository> repositories =
+                MavenResolverFactory.createRepositories(repositorySystem, session, credentials, settings);
 
         Log.info("%-12s %s", "Repository", repositories.getFirst().getUrl());
+        if (settings != null && credentials == null) {
+            Log.info("%-12s %s", "Settings", "~/.m2/settings.xml — " + settings.describe());
+        }
+        Log.info("%-12s %s", "Local repo", localRepository);
         Log.info("%-12s %s%s", "Policy", upgradeScope.describe(), dryRun ? ", dry run" : "");
 
         RemediationEngine.Options options = new RemediationEngine.Options(
-                upgradeScope, dryRun, checkLinkage, Math.max(1, maxCandidates));
+                upgradeScope, dryRun, checkLinkage, Math.max(1, maxCandidates), alignFamilies);
 
         return new RemediationEngine(
                 scanReport, repositorySystem, session, repositories, credentials, projectPath, options)

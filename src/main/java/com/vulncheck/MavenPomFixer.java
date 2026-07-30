@@ -14,6 +14,7 @@ import org.openrewrite.maven.ChangeDependencyGroupIdAndArtifactId;
 import org.openrewrite.maven.ChangeParentPom;
 import org.openrewrite.maven.MavenExecutionContextView;
 import org.openrewrite.maven.MavenParser;
+import org.openrewrite.maven.RemoveRedundantDependencyVersions;
 import org.openrewrite.maven.UpgradeDependencyVersion;
 import org.openrewrite.maven.tree.MavenRepository;
 import org.openrewrite.tree.ParseError;
@@ -80,13 +81,42 @@ public class MavenPomFixer {
 
     /** Runs a recipe and returns the rewritten content, or {@code null} when it changed nothing. */
     private String runRecipe(Recipe recipe, List<SourceFile> docs, ExecutionContext ctx) {
+        List<SourceFile> after = applyRecipe(recipe, docs, ctx);
+        return after == null ? null : after.getFirst().printAll();
+    }
+
+    /** Applies one recipe, returning the new sources or {@code null} when nothing changed. */
+    private List<SourceFile> applyRecipe(Recipe recipe, List<SourceFile> docs, ExecutionContext ctx) {
         RecipeRun run = recipe.run(new InMemoryLargeSourceSet(docs), ctx);
         List<Result> results = run.getChangeset().getAllResults();
         if (results.isEmpty()) {
             return null;
         }
         SourceFile updated = results.getFirst().getAfter();
-        return updated == null ? null : updated.printAll();
+        return updated == null ? null : List.of(updated);
+    }
+
+    /**
+     * Runs recipes in sequence, feeding each one the output of the last.
+     *
+     * <p>The intermediate document is kept in memory rather than round-tripped through a file, so
+     * the Maven model OpenRewrite attaches to the source survives between steps — the later recipe
+     * needs it to know what the earlier one made managed.
+     *
+     * @return the final content, or {@code null} when no recipe in the chain changed anything
+     */
+    private String runRecipeChain(List<Recipe> recipes, List<SourceFile> docs, ExecutionContext ctx) {
+        List<SourceFile> current = docs;
+        boolean changed = false;
+
+        for (Recipe recipe : recipes) {
+            List<SourceFile> after = applyRecipe(recipe, current, ctx);
+            if (after != null) {
+                current = after;
+                changed = true;
+            }
+        }
+        return changed ? current.getFirst().printAll() : null;
     }
 
     /**
@@ -165,6 +195,47 @@ public class MavenPomFixer {
         } catch (Exception e) {
             Log.debug("Managed-override preview failed for %s:%s -> %s: %s",
                     groupId, artifactId, version, Log.describe(e));
+        }
+        return null;
+    }
+
+    /**
+     * Computes the POM content that would result from importing {@code bomGroupId:bomArtifactId}
+     * and dropping the now-redundant explicit versions of {@code dependencyGroupId}'s artifacts.
+     *
+     * <p>Two recipes, in this order and for a reason. The import alone would leave every existing
+     * {@code <version>} in place, and those win over an imported BOM — the family would stay
+     * skewed and the diff would suggest otherwise. So
+     * {@code RemoveRedundantDependencyVersions} follows to strip them.
+     *
+     * <p>It runs with {@code GTE} rather than the default {@code EQ}: {@code EQ} only removes a
+     * version identical to the managed one, which is exactly the case that was never the problem.
+     * {@code GTE} removes an explicit version whenever the BOM pins the same or newer, which is
+     * what makes stragglers actually move up.
+     *
+     * <p>A property-driven version leaves its {@code <property>} behind — OpenRewrite does not
+     * clean those up yet (openrewrite/rewrite#4350). Harmless, but it shows up in the diff.
+     */
+    public String previewBomImport(File pomFile, String bomGroupId, String bomArtifactId, String version,
+                                   String dependencyGroupId) {
+        try {
+            ExecutionContext ctx = createContext();
+            List<SourceFile> docs = parsePom(ctx, pomFile.toPath());
+
+            return runRecipeChain(List.of(
+                    new AddManagedDependency(
+                            bomGroupId, bomArtifactId, version,
+                            "import", "pom", null, null, null,
+                            dependencyGroupId + ":*", null,
+                            "imported by vulnchecker to keep " + dependencyGroupId + " artifacts on one version"),
+                    new RemoveRedundantDependencyVersions(
+                            dependencyGroupId, "*",
+                            RemoveRedundantDependencyVersions.Comparator.GTE, null)
+            ), docs, ctx);
+
+        } catch (Exception e) {
+            Log.debug("BOM import preview failed for %s:%s:%s: %s",
+                    bomGroupId, bomArtifactId, version, Log.describe(e));
         }
         return null;
     }
