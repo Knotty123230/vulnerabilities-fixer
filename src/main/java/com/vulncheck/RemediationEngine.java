@@ -36,10 +36,12 @@ public class RemediationEngine {
             boolean dryRun,
             boolean checkLinkage,
             int maxAttemptsPerStrategy,
-            boolean alignFamilies
+            boolean alignFamilies,
+            boolean checkQuarantine,
+            boolean fixQuarantined
     ) {
         public static Options defaults() {
-            return new Options(VersionPolicy.UpgradeScope.MINOR, false, false, 12, false);
+            return new Options(VersionPolicy.UpgradeScope.MINOR, false, false, 12, false, true, false);
         }
     }
 
@@ -63,6 +65,7 @@ public class RemediationEngine {
     private final LinkageAnalyzer linkageAnalyzer;
     private final BomLocator bomLocator;
     private final VersionSkewDetector skewDetector;
+    private final ArtifactAvailability availability;
     private final Path projectPath;
     private final Options options;
 
@@ -82,6 +85,7 @@ public class RemediationEngine {
         this.linkageAnalyzer = new LinkageAnalyzer(analyzer, projectPath);
         this.bomLocator = new BomLocator(repositorySystem, session, repositories, versionCatalog);
         this.skewDetector = new VersionSkewDetector(bomLocator);
+        this.availability = new ArtifactAvailability(repositorySystem, session, repositories, credentials);
     }
 
     // ------------------------------------------------------------------
@@ -126,13 +130,26 @@ public class RemediationEngine {
             }
         }
 
+        List<ScanReport.QuarantinedComponent> quarantined = List.of();
+        if (options.fixQuarantined()) {
+            quarantined = handleQuarantine(pomFile, graph);
+            if (quarantined.stream().anyMatch(c -> c.outcome() == ScanReport.Outcome.FIXED)) {
+                analyzer.invalidate(pomFile);
+                graph = analyzer.buildGraphFromPom(pomFile);
+            }
+        }
+
         // Skew is assessed on the final graph, so a family that the fixes happened to align
         // is not reported as an outstanding problem.
         Log.section("Checking for version skew");
-        List<ScanReport.FamilySkew> skews = detectSkew(graph);
-        Log.step(skews.isEmpty()
+        List<VersionSkewDetector.Skew> detected = detectSkew(graph);
+        Log.step(detected.isEmpty()
                 ? "No mixed-version artifact families found."
-                : skews.size() + " artifact family/families resolve at mixed versions.");
+                : detected.size() + " artifact family/families resolve at mixed versions.");
+
+        List<ScanReport.FamilySkew> skews = options.alignFamilies()
+                ? alignFamilies(pomFile, detected)
+                : detected.stream().map(RemediationEngine::unalignedReport).toList();
 
         return new ScanReport(
                 projectPath.toAbsolutePath().normalize().toString(),
@@ -144,28 +161,274 @@ public class RemediationEngine {
                 options.upgradeScope().describe(),
                 report.totalComponents(),
                 List.copyOf(findings),
-                skews);
+                skews,
+                quarantined);
+    }
+
+    // ------------------------------------------------------------------
+    // Repository firewall quarantine
+    // ------------------------------------------------------------------
+
+    /**
+     * Finds components the repository firewall refuses to serve and moves them to a version it
+     * will serve.
+     *
+     * <p>This is a build-blocking problem rather than a security one, and it is not visible to the
+     * vulnerability feed at all: the scanner reports what is risky, while the firewall reports what
+     * this organisation will not let through. The two overlap but neither contains the other, so
+     * quarantine is discovered by probing the resolved graph.
+     *
+     * <p>Every artifact in the graph is probed, which means downloading it. That is the same work
+     * the build itself would do, and it is the only way to learn the answer — but it is why this
+     * runs behind {@code --fix-quarantined} rather than always.
+     */
+    private List<ScanReport.QuarantinedComponent> handleQuarantine(File pomFile, DependencyNode graph) {
+        Log.section("Checking the repository firewall");
+
+        List<Artifact> artifacts = collectArtifacts(graph);
+        List<ScanReport.QuarantinedComponent> results = new ArrayList<>();
+        int blocked = 0;
+
+        for (Artifact artifact : artifacts) {
+            ArtifactAvailability.Result probe = availability.check(artifact);
+            if (!probe.isQuarantined()) {
+                continue;
+            }
+            blocked++;
+            Log.step("%s %s", Log.red("quarantined"), artifact);
+            results.add(remediateQuarantine(pomFile, graph, artifact, probe));
+        }
+
+        Log.step("Probed %d artifact(s); %d quarantined.", artifacts.size(), blocked);
+        return List.copyOf(results);
+    }
+
+    private ScanReport.QuarantinedComponent remediateQuarantine(File pomFile, DependencyNode graph,
+                                                                Artifact artifact,
+                                                                ArtifactAvailability.Result probe) {
+        List<String> notes = new ArrayList<>();
+        List<LocalProjectAnalyzer.GraphPath> paths =
+                analyzer.findPathsTo(graph, artifact.getGroupId(), artifact.getArtifactId());
+        String path = paths.isEmpty() ? null : paths.getFirst().render();
+
+        List<String> candidates = versionCatalog.upgradeCandidates(
+                artifact.getGroupId(), artifact.getArtifactId(), artifact.getExtension(),
+                artifact.getVersion(), options.upgradeScope());
+
+        if (candidates.isEmpty()) {
+            notes.add("no newer version within the " + options.upgradeScope().describe()
+                    + " policy; try --upgrade-scope major");
+            return quarantineResult(artifact, probe, path, null,
+                    ScanReport.Outcome.NO_WORKING_FIX, notes);
+        }
+
+        // Ascending, so the smallest move that the firewall accepts wins.
+        Optional<String> replacement = availability.firstUsable(
+                artifact.getGroupId(), artifact.getArtifactId(), artifact.getExtension(), candidates);
+        if (replacement.isEmpty()) {
+            notes.add("every candidate version is also quarantined (tried " + candidates.size() + ")");
+            return quarantineResult(artifact, probe, path, null,
+                    ScanReport.Outcome.NO_WORKING_FIX, notes);
+        }
+
+        String version = replacement.get();
+        String pomContent = pomFixer.previewManagedOverride(
+                pomFile, artifact.getGroupId(), artifact.getArtifactId(), version);
+        if (pomContent == null) {
+            notes.add("could not express a version override for this artifact");
+            return quarantineResult(artifact, probe, path, version, ScanReport.Outcome.NO_WORKING_FIX, notes);
+        }
+
+        notes.add("pinned to the nearest version the firewall allows");
+        if (options.dryRun()) {
+            return quarantineResult(artifact, probe, path, version, ScanReport.Outcome.WOULD_FIX, notes);
+        }
+
+        try {
+            pomFixer.write(pomFile, pomContent);
+            analyzer.invalidate(pomFile);
+            Log.step("  pinned %s:%s to %s", artifact.getGroupId(), artifact.getArtifactId(), version);
+            return quarantineResult(artifact, probe, path, version, ScanReport.Outcome.FIXED, notes);
+        } catch (Exception e) {
+            notes.add("failed to write the POM: " + Log.describe(e));
+            return quarantineResult(artifact, probe, path, version, ScanReport.Outcome.ERROR, notes);
+        }
+    }
+
+    private static ScanReport.QuarantinedComponent quarantineResult(Artifact artifact,
+                                                                    ArtifactAvailability.Result probe,
+                                                                    String path, String replacement,
+                                                                    ScanReport.Outcome outcome,
+                                                                    List<String> notes) {
+        return new ScanReport.QuarantinedComponent(
+                artifact.getGroupId(), artifact.getArtifactId(), artifact.getVersion(),
+                probe.quarantineUrl(), path, replacement, outcome, List.copyOf(notes));
+    }
+
+    private static List<Artifact> collectArtifacts(DependencyNode root) {
+        List<Artifact> artifacts = new ArrayList<>();
+        Set<String> seen = new LinkedHashSet<>();
+        root.accept(new org.eclipse.aether.graph.DependencyVisitor() {
+            @Override
+            public boolean visitEnter(DependencyNode node) {
+                Artifact artifact = node.getArtifact();
+                if (node != root && artifact != null && seen.add(artifact.toString())) {
+                    artifacts.add(artifact);
+                }
+                return true;
+            }
+
+            @Override
+            public boolean visitLeave(DependencyNode node) {
+                return true;
+            }
+        });
+        return artifacts;
     }
 
     /**
      * Reports mixed-version families. Detection always runs — knowing a family has drifted is
      * useful whether or not the tool is allowed to restructure the POM to fix it.
      */
-    private List<ScanReport.FamilySkew> detectSkew(DependencyNode graph) {
+    private List<VersionSkewDetector.Skew> detectSkew(DependencyNode graph) {
         try {
-            return skewDetector.detect(graph).stream()
-                    .map(skew -> new ScanReport.FamilySkew(
-                            skew.groupId(),
-                            skew.distinctVersions(),
-                            skew.resolvedArtifacts(),
-                            skew.bomCoordinate(),
-                            skew.bom() == null ? null : skew.bom().version(),
-                            false))
-                    .toList();
+            return skewDetector.detect(graph);
         } catch (Exception e) {
             Log.debug("Version-skew detection failed: %s", Log.describe(e));
             return List.of();
         }
+    }
+
+    private static ScanReport.FamilySkew unalignedReport(VersionSkewDetector.Skew skew) {
+        return new ScanReport.FamilySkew(
+                skew.groupId(), skew.distinctVersions(), skew.resolvedArtifacts(),
+                skew.bomCoordinate(), skew.bom() == null ? null : skew.bom().version(),
+                false, null,
+                List.of("re-run with --align-families to import the BOM and pin the family"));
+    }
+
+    /**
+     * Imports a family BOM for each skewed family, independently of any vulnerability.
+     *
+     * <p>Skew is its own defect: these families are inconsistent whether or not an advisory happens
+     * to point at them today, and in a project with no findings at all — which is common — there is
+     * no remediation pass to piggyback on. Alignment therefore runs as its own phase.
+     *
+     * <p>Families are handled one at a time against the POM on disk, so each preview sees the
+     * previous edit. Nothing is written until re-resolving proves the family actually converged on
+     * one version; a BOM that leaves stragglers behind (the {@code netty-transport-native-*} case)
+     * is rejected rather than reported as a fix.
+     */
+    private List<ScanReport.FamilySkew> alignFamilies(File pomFile, List<VersionSkewDetector.Skew> skews) {
+        if (skews.isEmpty()) {
+            return List.of();
+        }
+        Log.section("Aligning artifact families");
+
+        List<ScanReport.FamilySkew> results = new ArrayList<>();
+        for (VersionSkewDetector.Skew skew : skews) {
+            results.add(alignFamily(pomFile, skew));
+        }
+        return List.copyOf(results);
+    }
+
+    private ScanReport.FamilySkew alignFamily(File pomFile, VersionSkewDetector.Skew skew) {
+        List<String> notes = new ArrayList<>();
+        BomLocator.Bom bom = skew.bom();
+
+        List<String> candidates = cap(bomLocator.upgradeCandidates(
+                bom, skew.highestVersion(), options.upgradeScope()));
+        if (candidates.isEmpty()) {
+            notes.add("no " + bom.coordinate() + " version at or above " + skew.highestVersion()
+                    + " within the " + options.upgradeScope().describe() + " policy");
+            return skewResult(skew, false, null, notes);
+        }
+
+        for (String version : candidates) {
+            String pomContent = pomFixer.previewBomImport(
+                    pomFile, bom.groupId(), bom.artifactId(), version, skew.groupId());
+            if (pomContent == null) {
+                continue;
+            }
+            if (!verifiesAsAligned(pomContent, skew)) {
+                continue;
+            }
+
+            String change = "import " + bom.coordinate() + ":" + version;
+            if (options.dryRun()) {
+                notes.add("would pin " + skew.groupId() + " to " + version);
+                Log.step("%s %-32s %s", Log.cyan("would align"), skew.groupId(), change);
+                return skewResult(skew, true, change, notes);
+            }
+            try {
+                pomFixer.write(pomFile, pomContent);
+                analyzer.invalidate(pomFile);
+                Log.step("%s %-32s %s", Log.green("aligned"), skew.groupId(), change);
+                notes.add("family pinned to " + version);
+                return skewResult(skew, true, change, notes);
+            } catch (Exception e) {
+                notes.add("failed to write the POM: " + Log.describe(e));
+                return skewResult(skew, false, null, notes);
+            }
+        }
+
+        notes.add("no BOM version produced a consistent family; tried " + candidates.size()
+                + " version(s). Aligning may require a major upgrade of the lagging artifact "
+                + "— re-run with --upgrade-scope major if that is acceptable.");
+        Log.step("%s %-32s %s", Log.yellow("not aligned"), skew.groupId(), bom.coordinate());
+        return skewResult(skew, false, null, notes);
+    }
+
+    /**
+     * Confirms a candidate POM leaves the family on exactly one version, and — when the
+     * binary-compatibility check is enabled — that nothing stops linking as a result.
+     */
+    private boolean verifiesAsAligned(String pomContent, VersionSkewDetector.Skew skew) {
+        Path scratch = projectPath.resolve(".vulnchecker-align.pom.xml");
+        try {
+            Files.writeString(scratch, pomContent);
+            DependencyNode candidate = analyzer.buildGraphFromPom(scratch.toFile());
+
+            Set<String> versions = new LinkedHashSet<>();
+            for (Artifact artifact : collectArtifacts(candidate)) {
+                if (artifact.getGroupId().equals(skew.groupId())) {
+                    versions.add(artifact.getVersion());
+                }
+            }
+            if (versions.size() != 1) {
+                Log.debug("  %s: still %s after import", skew.groupId(), versions);
+                return false;
+            }
+
+            if (options.checkLinkage()) {
+                String probe = skew.resolvedArtifacts().keySet().iterator().next();
+                linkageAnalyzer.establishBaseline(candidate, skew.groupId(), probe);
+                LinkageAnalyzer.Verdict verdict = linkageAnalyzer.verify(candidate, skew.groupId(), probe);
+                if (!verdict.wasSkipped() && !verdict.compatible()) {
+                    Log.debug("  %s: alignment breaks binary compatibility", skew.groupId());
+                    return false;
+                }
+            }
+            return true;
+
+        } catch (Exception e) {
+            Log.debug("  %s: candidate POM does not resolve: %s", skew.groupId(), Log.describe(e));
+            return false;
+        } finally {
+            try {
+                Files.deleteIfExists(scratch);
+            } catch (Exception cleanupFailure) {
+                Log.debug("Could not remove scratch POM %s: %s", scratch, cleanupFailure.getMessage());
+            }
+        }
+    }
+
+    private static ScanReport.FamilySkew skewResult(VersionSkewDetector.Skew skew, boolean aligned,
+                                                    String change, List<String> notes) {
+        return new ScanReport.FamilySkew(
+                skew.groupId(), skew.distinctVersions(), skew.resolvedArtifacts(),
+                skew.bomCoordinate(), skew.bom() == null ? null : skew.bom().version(),
+                aligned, change, List.copyOf(notes));
     }
 
     /** One-glance status for the progress line, so a long run is never silently opaque. */
@@ -245,6 +508,16 @@ public class RemediationEngine {
         }
 
         builder.candidates(List.copyOf(attempted));
+
+        // A version the firewall refuses is a different failure from "no fix exists", and the
+        // difference decides who has to act: the developer, or whoever administers the firewall.
+        Set<String> blocked = strategies.stream()
+                .flatMap(s -> s.blockedVersions.stream())
+                .collect(java.util.stream.Collectors.toCollection(LinkedHashSet::new));
+        if (!blocked.isEmpty()) {
+            builder.note("rejected by the repository firewall: " + String.join(", ", blocked));
+        }
+
         boolean anyCompatibilityRejection = strategies.stream().anyMatch(s -> s.rejectedForCompatibility);
         if (anyCompatibilityRejection) {
             return builder.outcome(ScanReport.Outcome.REJECTED_BREAKS_COMPATIBILITY)
@@ -292,6 +565,8 @@ public class RemediationEngine {
 
         private boolean rejectedForCompatibility;
         private List<String> linkageWarnings = List.of();
+        /** Versions rejected because the repository would not serve them. */
+        private final Set<String> blockedVersions = new LinkedHashSet<>();
 
         Strategy(String name, String editedCoordinate, String currentVersion, List<String> candidates,
                  Function<String, String> preview) {
@@ -602,6 +877,19 @@ public class RemediationEngine {
             if (VersionPolicy.isStillAffected(resolved, vulnerability.version(), vulnerability.versionToFix())) {
                 Log.debug("  %s @ %s: still resolves %s", strategy.name(), version, resolved);
                 return null;
+            }
+
+            // A version that metadata offers but the firewall refuses would turn a security fix
+            // into a build failure, so the artifact is proven downloadable before being accepted.
+            if (options.checkQuarantine()) {
+                ArtifactAvailability.Result probe = availability.check(
+                        vulnerability.groupId(), vulnerability.artifactId(), "jar", resolved);
+                if (!probe.isUsable()) {
+                    Log.debug("  %s @ %s: resolved version %s is %s",
+                            strategy.name(), version, resolved, probe.status());
+                    strategy.blockedVersions.add(resolved + " (" + probe.status() + ")");
+                    return null;
+                }
             }
 
             if (options.checkLinkage()) {

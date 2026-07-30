@@ -100,6 +100,21 @@ public class Vulnchecker implements Callable<Integer> {
     private boolean alignFamilies;
 
     @CommandLine.Option(
+            names = "--fix-quarantined",
+            description = "Probe every resolved artifact against the repository firewall and pin "
+                    + "any quarantined component to the nearest version it will serve. Downloads "
+                    + "the whole classpath, so it is opt-in.")
+    private boolean fixQuarantined;
+
+    @CommandLine.Option(
+            names = "--check-quarantine",
+            negatable = true,
+            defaultValue = "true",
+            description = "Before accepting a fix, confirm the chosen version is not quarantined "
+                    + "by the repository firewall. Enabled by default; --no-check-quarantine skips it.")
+    private boolean checkQuarantine;
+
+    @CommandLine.Option(
             names = "--max-candidates",
             paramLabel = "N",
             defaultValue = "12",
@@ -289,7 +304,8 @@ public class Vulnchecker implements Callable<Integer> {
         Log.info("%-12s %s%s", "Policy", upgradeScope.describe(), dryRun ? ", dry run" : "");
 
         RemediationEngine.Options options = new RemediationEngine.Options(
-                upgradeScope, dryRun, checkLinkage, Math.max(1, maxCandidates), alignFamilies);
+                upgradeScope, dryRun, checkLinkage, Math.max(1, maxCandidates), alignFamilies,
+                checkQuarantine, fixQuarantined);
 
         return new RemediationEngine(
                 scanReport, repositorySystem, session, repositories, credentials, projectPath, options)
@@ -327,6 +343,15 @@ public class Vulnchecker implements Callable<Integer> {
 
     /** Translates the report into the process exit code a pipeline gates on. */
     private int gateVerdict(ScanReport report) {
+        // A quarantined component is not a severity judgement — nothing builds until it is
+        // resolved — so it fails the gate regardless of the threshold.
+        if (report.hasBlockingQuarantine() && failOn != SeverityThreshold.NONE) {
+            Log.report(Log.red("Gate failed") + " — "
+                    + report.unresolvedQuarantines().size()
+                    + " component(s) blocked by the repository firewall");
+            return EXIT_GATE_FAILED;
+        }
+
         int highest = report.highestOutstandingSeverity();
         if (failOn == SeverityThreshold.NONE || highest < failOn.rank) {
             Log.report(Log.green("Gate passed") + " (threshold: " + failOn + ")");

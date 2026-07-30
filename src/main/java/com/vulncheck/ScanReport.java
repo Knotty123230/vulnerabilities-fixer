@@ -27,8 +27,32 @@ public record ScanReport(
         String upgradeScope,
         int componentsScanned,
         List<Finding> findings,
-        List<FamilySkew> familySkews
+        List<FamilySkew> familySkews,
+        List<QuarantinedComponent> quarantined
 ) {
+
+    /**
+     * A component the repository firewall refuses to serve.
+     *
+     * <p>Tracked separately from vulnerabilities: a quarantined artifact does not merely carry
+     * risk, it stops the build outright, and the fix is always "move to a version that is not
+     * quarantined" rather than anything the advisory feed suggests.
+     */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public record QuarantinedComponent(
+            String groupId,
+            String artifactId,
+            String version,
+            String quarantineUrl,
+            String dependencyPath,
+            String replacementVersion,
+            Outcome outcome,
+            List<String> notes
+    ) {
+        public String gav() {
+            return groupId + ":" + artifactId + ":" + version;
+        }
+    }
 
     /**
      * A group of artifacts that ship as a unit but resolved at more than one version.
@@ -43,8 +67,13 @@ public record ScanReport(
             Map<String, String> resolvedArtifacts,
             String bomCoordinate,
             String suggestedBomVersion,
-            boolean aligned
+            boolean aligned,
+            String appliedChange,
+            List<String> notes
     ) {
+        public List<String> notes() {
+            return notes == null ? List.of() : notes;
+        }
     }
 
     /** What the tool managed to do about one vulnerable component. */
@@ -144,6 +173,22 @@ public record ScanReport(
     /** Highest severity among findings that are still outstanding; 0 when there are none. */
     public int highestOutstandingSeverity() {
         return outstanding().stream().mapToInt(Finding::severityRank).max().orElse(0);
+    }
+
+    /** Quarantined components that were not resolved to a usable version. */
+    public List<QuarantinedComponent> unresolvedQuarantines() {
+        return quarantined == null ? List.of() : quarantined.stream()
+                .filter(component -> !component.outcome().isResolved())
+                .toList();
+    }
+
+    /**
+     * Whether the build is currently blocked. A quarantined component is not a severity question —
+     * nothing compiles until it is dealt with — so it fails the gate at any {@code --fail-on}
+     * setting other than {@code NONE}.
+     */
+    public boolean hasBlockingQuarantine() {
+        return !unresolvedQuarantines().isEmpty();
     }
 
     public boolean anyChangesWritten() {

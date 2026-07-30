@@ -21,9 +21,42 @@ public final class ConsoleReportRenderer {
         renderHeader(report);
         renderGroup("RESOLVED", report.findings().stream().filter(f -> f.outcome().isResolved()).toList(), true);
         renderGroup("OUTSTANDING", report.outstanding(), false);
+        renderQuarantine(report);
         renderInformational(report);
         renderFamilySkew(report);
         renderSummary(report);
+    }
+
+    /**
+     * Components the repository firewall refuses to serve. Rendered above everything else because
+     * they block the build outright — no other finding matters until these are cleared.
+     */
+    private static void renderQuarantine(ScanReport report) {
+        List<ScanReport.QuarantinedComponent> quarantined = report.quarantined();
+        if (quarantined == null || quarantined.isEmpty()) {
+            return;
+        }
+        Log.report("");
+        Log.report(Log.red(Log.bold("QUARANTINED BY REPOSITORY FIREWALL (" + quarantined.size() + ")")));
+        Log.report(Log.dim("  These components cannot be downloaded — the build fails until they move."));
+
+        for (ScanReport.QuarantinedComponent component : quarantined) {
+            boolean resolved = component.outcome().isResolved();
+            Log.report("  %s %s", resolved ? Log.green("✔") : Log.red("✖"), Log.bold(component.gav()));
+
+            if (component.replacementVersion() != null) {
+                Log.report("      %s %s:%s -> %s",
+                        Log.cyan("fix"), component.groupId(), component.artifactId(),
+                        component.replacementVersion());
+            }
+            if (component.dependencyPath() != null) {
+                Log.report("      %s %s", Log.dim("via"), component.dependencyPath());
+            }
+            if (component.quarantineUrl() != null) {
+                Log.report("      %s %s", Log.dim("why"), component.quarantineUrl());
+            }
+            component.notes().forEach(note -> Log.report("      %s %s", Log.dim("note"), note));
+        }
     }
 
     /**
@@ -41,7 +74,7 @@ public final class ConsoleReportRenderer {
 
         for (ScanReport.FamilySkew skew : skews) {
             Log.report("  %s %s %s",
-                    Log.yellow("!"),
+                    skew.aligned() ? Log.green("✔") : Log.yellow("!"),
                     Log.bold(skew.groupId()),
                     Log.dim(String.join(", ", skew.versions())));
 
@@ -51,11 +84,13 @@ public final class ConsoleReportRenderer {
                     .forEach(entry -> Log.report("      %s %s:%s",
                             Log.dim("   "), entry.getKey(), entry.getValue()));
 
-            if (skew.bomCoordinate() != null) {
+            if (skew.appliedChange() != null) {
+                Log.report("      %s %s", Log.cyan("fix"), skew.appliedChange());
+            } else if (skew.bomCoordinate() != null) {
                 Log.report("      %s import %s:%s to pin the whole family",
                         Log.cyan("fix"), skew.bomCoordinate(), skew.suggestedBomVersion());
-                Log.report("      %s %s", Log.dim("   "), Log.dim("re-run with --align-families to apply"));
             }
+            skew.notes().forEach(note -> Log.report("      %s %s", Log.dim("note"), note));
         }
     }
 

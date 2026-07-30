@@ -66,6 +66,8 @@ reports exactly what it would change without touching a file.
 | `--fail-on CRITICAL\|HIGH\|MEDIUM\|LOW\|NONE` | `HIGH` | Severity that makes the gate fail |
 | `--check-linkage` | off | Also verify binary compatibility (see below) |
 | `--align-families` | off | Allow importing a family BOM to fix mixed versions (see below) |
+| `--fix-quarantined` | off | Pin components blocked by the repository firewall (see below) |
+| `--no-check-quarantine` | — | Skip verifying that a chosen version is not quarantined |
 | `--report-format MARKDOWN\|JSON` | `MARKDOWN` | Format for `--report-file` |
 | `--report-file FILE` | — | Write the report to a file as well |
 | `--max-candidates N` | `12` | Cap on versions tried per strategy |
@@ -131,8 +133,10 @@ to *the same* version. The BOM is found by naming convention plus a small curate
 descriptor** — `ch.qos.logback` publishes `logback-parent`, which a convention-only guess would
 wrongly adopt.
 
-With `--align-families`, a fix that touches an already-skewed family imports the BOM and strips the
-now-redundant versions:
+With `--align-families`, every skewed family is aligned — whether or not any vulnerability points
+at it. A project with a clean security report and a drifted family is the common case, so this
+runs as its own phase rather than only inside vulnerability remediation. The BOM is imported and
+the now-redundant versions are stripped:
 
 ```xml
 <dependencyManagement>
@@ -145,10 +149,16 @@ now-redundant versions:
 </dependencyManagement>
 ```
 
-Off by default, and deliberately conditional on observed skew, because the import lands in the
-current POM's `dependencyManagement` — which outranks any inherited BOM. In a Spring Boot project
-that silently detaches the family from the Boot BOM, and the next Boot upgrade drags a stale pin
-along.
+Off by default, and only applied to families that have actually drifted, because the import lands
+in the current POM's `dependencyManagement` — which outranks any inherited BOM. In a Spring Boot
+project that silently detaches the family from the Boot BOM, and the next Boot upgrade drags a
+stale pin along.
+
+Nothing is written until re-resolving proves the family converged on a single version. Aligning a
+badly split family can require a major upgrade of the laggard — `org.glassfish.jaxb` at `2.3.1`
+and `4.0.9` cannot be unified without moving `jaxb-runtime` across the `javax`→`jakarta` break —
+and in that case the tool reports that no BOM version worked rather than writing a POM that
+compiles into a different API. Pair it with `--check-linkage` when the jump is large.
 
 Two caveats worth knowing. A BOM does not guarantee full coverage: `netty-bom` has historically
 omitted the `netty-transport-native-*` artifacts ([netty#6738](https://github.com/netty/netty/issues/6738)),
@@ -161,6 +171,49 @@ To gate on this in CI independently of the fixer, Maven Enforcer's
 [`dependencyConvergence`](https://maven.apache.org/enforcer/enforcer-rules/dependencyConvergence.html)
 and [`requireUpperBoundDeps`](https://maven.apache.org/enforcer/enforcer-rules/requireUpperBoundDeps.html)
 rules cover the same ground and are usually enabled together.
+
+### Repository firewall quarantine (`--fix-quarantined`)
+
+Sonatype Repository Firewall quarantines a component the first time it is requested if it violates
+policy, and the proxy answers with HTTP 403:
+
+```
+status code: 403, reason phrase: ---->>> REQUESTED ITEM IS QUARANTINED ---->>>
+FOR DETAILS SEE ---->>> https://iq.example.com/ui/links/firewall/repositories/quarantinedComponent/... <<<----
+```
+
+That is a build-stopping problem, and the
+[documented remediation](https://help.sonatype.com/en/firewall-quarantine.html) is to move to a
+version without the violation — which is what this automates.
+
+Two separate behaviours:
+
+**Always on: never fix into a quarantined version.** `maven-metadata.xml` lists every published
+version, including ones this network will refuse. Choosing a fix from metadata alone can swap a
+CVE for a broken build, so before a candidate is accepted the artifact is confirmed downloadable.
+Disable with `--no-check-quarantine`.
+
+**Opt-in: `--fix-quarantined`.** Probes every resolved artifact and pins each quarantined one to
+the nearest version the firewall serves. This downloads the classpath — the same work the build
+would do — which is why it is not on by default.
+
+```
+QUARANTINED BY REPOSITORY FIREWALL (1)
+  ✔ org.jetbrains.kotlinx:kotlinx-metadata-jvm:0.9.0
+      fix org.jetbrains.kotlinx:kotlinx-metadata-jvm -> 0.9.1
+      via io.quarkus:quarkus-core:3.32.3 -> org.jetbrains.kotlinx:kotlinx-metadata-jvm:0.9.0
+      why https://iq.example.com/ui/links/firewall/repositories/quarantinedComponent/...
+```
+
+A quarantined component that could not be moved **fails the gate at any `--fail-on` level except
+`NONE`** — it is not a severity judgement, nothing builds until it is resolved.
+
+Two implementation notes that matter in practice. A plain 403 (bad credentials) is deliberately
+told apart from a quarantine, because they demand opposite responses — try another version, or
+stop and fix the login; only the response body distinguishes them, and Maven Resolver 2.x discards
+it, so the tool re-requests the artifact directly to read it. And probing a version the firewall
+has never seen is what causes it to be evaluated: harmless, since a version that quarantines on
+first sight is one you must not adopt, but it does add entries to the firewall dashboard.
 
 ### Binary compatibility (`--check-linkage`)
 

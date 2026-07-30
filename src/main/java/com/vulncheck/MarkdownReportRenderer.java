@@ -32,6 +32,7 @@ public final class MarkdownReportRenderer {
         row(md, "Duration", ConsoleReportRenderer.humanDuration(report.duration()));
         md.append('\n');
 
+        appendQuarantineSection(md, report);
         appendFixedSection(md, report);
         appendOutstandingSection(md, report);
         appendFamilySkewSection(md, report);
@@ -122,6 +123,27 @@ public final class MarkdownReportRenderer {
         md.append('\n');
     }
 
+    private static void appendQuarantineSection(StringBuilder md, ScanReport report) {
+        List<ScanReport.QuarantinedComponent> quarantined = report.quarantined();
+        if (quarantined == null || quarantined.isEmpty()) {
+            return;
+        }
+        md.append("## Quarantined by repository firewall (").append(quarantined.size()).append(")\n\n");
+        md.append("These components cannot be downloaded; the build fails until they move.\n\n");
+        md.append("| Component | Status | Replacement | Details |\n|---|---|---|---|\n");
+
+        for (ScanReport.QuarantinedComponent component : quarantined) {
+            md.append("| ").append(code(component.gav()))
+                    .append(" | ").append(component.outcome())
+                    .append(" | ").append(component.replacementVersion() == null
+                            ? "—" : code(component.replacementVersion()))
+                    .append(" | ").append(component.quarantineUrl() == null
+                            ? "—" : "[quarantine](" + component.quarantineUrl() + ")")
+                    .append(" |\n");
+        }
+        md.append('\n');
+    }
+
     private static void appendFamilySkewSection(StringBuilder md, ScanReport report) {
         List<ScanReport.FamilySkew> skews = report.familySkews();
         if (skews == null || skews.isEmpty()) {
@@ -131,17 +153,28 @@ public final class MarkdownReportRenderer {
         md.append("These artifacts ship as a set but resolved at different versions, which risks ")
                 .append("`NoSuchMethodError` at runtime even without a CVE.\n\n");
 
-        md.append("| Family | Resolved versions | Suggested fix |\n|---|---|---|\n");
+        md.append("| Family | Resolved versions | Status | Fix |\n|---|---|---|---|\n");
         for (ScanReport.FamilySkew skew : skews) {
             md.append("| ").append(code(skew.groupId()))
                     .append(" | ").append(code(String.join(", ", skew.versions())))
+                    .append(" | ").append(skew.aligned() ? "aligned" : "mixed")
                     .append(" | ")
-                    .append(skew.bomCoordinate() == null
-                            ? "—"
-                            : "import " + code(skew.bomCoordinate() + ":" + skew.suggestedBomVersion()))
+                    .append(skew.appliedChange() != null
+                            ? code(skew.appliedChange())
+                            : skew.bomCoordinate() == null
+                                    ? "—"
+                                    : "import " + code(skew.bomCoordinate() + ":" + skew.suggestedBomVersion()))
                     .append(" |\n");
         }
-        md.append("\nRe-run with `--align-families` to apply the BOM imports.\n\n");
+        md.append('\n');
+
+        for (ScanReport.FamilySkew skew : skews) {
+            if (!skew.notes().isEmpty()) {
+                md.append("- **").append(skew.groupId()).append("**: ")
+                        .append(String.join("; ", skew.notes())).append('\n');
+            }
+        }
+        md.append('\n');
     }
 
     private static void appendNotReachableSection(StringBuilder md, ScanReport report) {
