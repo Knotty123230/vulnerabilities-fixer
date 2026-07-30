@@ -72,11 +72,19 @@ public final class SonatypeCredentialsStore {
         ));
     }
 
+    /**
+     * Reads the saved password, if there is one. Absence is not an error: CI runners have no
+     * Keychain and supply the password through {@code VULNCHECKER_SONATYPE_PASSWORD}.
+     */
     public Optional<String> loadPassword(String username) {
+        if (!isMacOs()) {
+            Log.debug("Keychain lookup skipped (not macOS); expecting the password from the environment.");
+            return Optional.empty();
+        }
         ProcessResult result = runKeychainCommand(
                 "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", username, "-w"
         );
-        return result.exitCode() == 0 ? Optional.of(result.output()) : Optional.empty();
+        return result.exitCode() == 0 ? Optional.of(result.output().strip()) : Optional.empty();
     }
 
     public void save(SonatypeCredentials credentials) {
@@ -136,8 +144,12 @@ public final class SonatypeCredentialsStore {
         }
     }
 
+    private static boolean isMacOs() {
+        return System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("mac");
+    }
+
     private static ProcessResult runKeychainCommand(String... arguments) {
-        if (!System.getProperty("os.name").toLowerCase().contains("mac")) {
+        if (!isMacOs()) {
             throw new IllegalStateException(
                     "Persistent Sonatype passwords require macOS Keychain. Use VULNCHECKER_SONATYPE_PASSWORD instead."
             );

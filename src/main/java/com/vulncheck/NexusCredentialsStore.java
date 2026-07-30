@@ -52,17 +52,32 @@ public final class NexusCredentialsStore {
         return Optional.of(new NexusSettings(properties.getProperty("url"), properties.getProperty("username")));
     }
 
+    /**
+     * Reads the saved password, if there is one.
+     *
+     * <p>Absence is not an error: on a CI runner there is no Keychain, and the password is
+     * expected to arrive through {@code VULNCHECKER_NEXUS_PASSWORD} instead. Throwing here
+     * would make the tool unusable in exactly the environment it is built for.
+     */
     public Optional<String> loadPassword(String username) {
+        if (!isMacOs()) {
+            Log.debug("Keychain lookup skipped (not macOS); expecting the password from the environment.");
+            return Optional.empty();
+        }
         ProcessResult result = runKeychainCommand(
                 "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", username, "-w"
         );
-        return result.exitCode() == 0 ? Optional.of(result.output()) : Optional.empty();
+        return result.exitCode() == 0 ? Optional.of(result.output().strip()) : Optional.empty();
     }
 
     public void save(NexusCredentials credentials) {
         createConfigDirectory();
         saveSettings(credentials);
 
+        if (credentials.username() == null || credentials.password() == null) {
+            // Anonymous repository: URL alone is worth persisting, there is no secret to store.
+            return;
+        }
         ProcessResult result = runKeychainCommand(
                 "add-generic-password", "-s", KEYCHAIN_SERVICE, "-a", credentials.username(),
                 "-w", credentials.password(), "-U"
@@ -84,7 +99,9 @@ public final class NexusCredentialsStore {
     private void saveSettings(NexusCredentials credentials) {
         Properties properties = new Properties();
         properties.setProperty("url", credentials.url());
-        properties.setProperty("username", credentials.username());
+        if (credentials.username() != null) {
+            properties.setProperty("username", credentials.username());
+        }
 
         try {
             Path temporaryFile = Files.createTempFile(configDirectory, "nexus", ".properties");
@@ -115,8 +132,12 @@ public final class NexusCredentialsStore {
         }
     }
 
+    private static boolean isMacOs() {
+        return System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("mac");
+    }
+
     private static ProcessResult runKeychainCommand(String... arguments) {
-        if (!System.getProperty("os.name").toLowerCase().contains("mac")) {
+        if (!isMacOs()) {
             throw new IllegalStateException(
                     "Persistent Nexus passwords require macOS Keychain. Use VULNCHECKER_NEXUS_PASSWORD instead."
             );
