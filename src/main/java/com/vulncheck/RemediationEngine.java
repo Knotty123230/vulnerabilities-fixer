@@ -91,12 +91,53 @@ public class RemediationEngine {
         this.options = options;
         this.analyzer = new LocalProjectAnalyzer(repositorySystem, session, repositories);
         this.versionCatalog = new VersionCatalog(repositorySystem, session, repositories);
-        this.pomFixer = new MavenPomFixer(credentials);
+        this.pomFixer = new MavenPomFixer(resolvePomFixerCredentials(credentials, session, repositories));
         this.linkageAnalyzer = new LinkageAnalyzer(analyzer, projectPath);
         this.bomLocator = new BomLocator(repositorySystem, session, repositories, versionCatalog);
         this.skewDetector = new VersionSkewDetector(bomLocator);
         this.availability = new ArtifactAvailability(repositorySystem, session, repositories, credentials);
         this.buildTimeArtifacts = new BuildTimeArtifacts(analyzer, availability);
+    }
+
+    /**
+     * Works out which repository OpenRewrite should talk to.
+     *
+     * <p>{@link MavenPomFixer} runs its own, separate Maven resolution (OpenRewrite's
+     * {@code MavenExecutionContextView}) to read parent POMs and BOM imports while computing an
+     * edit — the same class of lookup {@link LocalProjectAnalyzer} does via Aether. Aether gets its
+     * repository from {@code --nexus-url} <em>or</em> the mirrors in {@code settings.xml}; until
+     * now {@link MavenPomFixer} only ever learned about an <em>explicit</em> {@code --nexus-url}; a
+     * settings.xml-only mirror left it defaulting to Maven Central. On a network where only the
+     * corporate proxy is reachable — common in locked-down environments — that default made every
+     * recipe needing a private parent POM fail silently: not an exception, just "no recipe produced
+     * a change", because OpenRewrite could not read enough of the model to know where an edit
+     * belonged. Deriving credentials from the already-resolved {@code repositories} list keeps both
+     * resolvers pointed at the same place without asking the user to configure anything twice.
+     */
+    private static NexusCredentials resolvePomFixerCredentials(NexusCredentials explicit,
+                                                                RepositorySystemSession session,
+                                                                List<RemoteRepository> repositories) {
+        if (explicit != null || repositories.isEmpty()) {
+            return explicit;
+        }
+        RemoteRepository primary = repositories.getFirst();
+        if (MavenResolverFactory.CENTRAL_URL.equals(primary.getUrl())) {
+            // Genuinely nothing private in play; OpenRewrite's own Central default already matches.
+            return null;
+        }
+
+        String username = null;
+        String password = null;
+        try (org.eclipse.aether.repository.AuthenticationContext authCtx =
+                     org.eclipse.aether.repository.AuthenticationContext.forRepository(session, primary)) {
+            if (authCtx != null) {
+                username = authCtx.get(org.eclipse.aether.repository.AuthenticationContext.USERNAME);
+                password = authCtx.get(org.eclipse.aether.repository.AuthenticationContext.PASSWORD);
+            }
+        } catch (Exception e) {
+            Log.debug("Could not read repository authentication for OpenRewrite: %s", Log.describe(e));
+        }
+        return new NexusCredentials(primary.getUrl(), username, password);
     }
 
     // ------------------------------------------------------------------
