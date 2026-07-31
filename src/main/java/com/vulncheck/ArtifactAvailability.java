@@ -19,6 +19,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -236,6 +237,44 @@ public final class ArtifactAvailability {
                 + artifact.getVersion() + "/"
                 + artifact.getArtifactId() + "-" + artifact.getVersion() + classifier
                 + "." + artifact.getExtension();
+    }
+
+    /** The outcome of walking a candidate list: what was found, and what each version answered. */
+    public record Search(Optional<String> usable, Map<String, Status> checked) {
+
+        /** True when every version was checked and all of them were refused by the firewall. */
+        public boolean allQuarantined() {
+            return !checked.isEmpty() && checked.values().stream().allMatch(s -> s == Status.QUARANTINED);
+        }
+
+        /** {@code 0.8.0 QUARANTINED, 0.7.0 QUARANTINED, ...} for the report. */
+        public String render(int limit) {
+            return checked.entrySet().stream()
+                    .limit(limit)
+                    .map(entry -> entry.getKey() + " " + entry.getValue())
+                    .reduce((a, b) -> a + ", " + b)
+                    .orElse("none");
+        }
+    }
+
+    /**
+     * Walks {@code versions} in order and reports the first usable one, recording the verdict for
+     * every version tried.
+     *
+     * <p>The record is what makes an unfixable case explainable. "No version worked" leaves the
+     * reader unable to tell a firewall that blocks the whole artifact — where only a policy waiver
+     * helps — from one that blocks a single release, and those need entirely different action.
+     */
+    public Search findUsable(String groupId, String artifactId, String extension, List<String> versions) {
+        Map<String, Status> checked = new LinkedHashMap<>();
+        for (String version : versions) {
+            Result result = check(groupId, artifactId, extension, version);
+            checked.put(version, result.status());
+            if (result.isUsable()) {
+                return new Search(Optional.of(version), Map.copyOf(checked));
+            }
+        }
+        return new Search(Optional.empty(), Map.copyOf(checked));
     }
 
     /**

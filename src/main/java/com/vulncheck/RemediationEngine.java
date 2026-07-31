@@ -406,9 +406,11 @@ public class RemediationEngine {
                 artifact.getVersion(), options.upgradeScope());
 
         // Ascending, so the smallest move that the firewall accepts wins.
-        Optional<String> replacement = availability.firstUsable(
+        ArtifactAvailability.Search upward = availability.findUsable(
                 artifact.getGroupId(), artifact.getArtifactId(), artifact.getExtension(), upgrades);
+        Optional<String> replacement = upward.usable();
 
+        ArtifactAvailability.Search downward = null;
         boolean downgraded = false;
         if (replacement.isEmpty()) {
             // Upgrading is not always possible: the newest release can be the quarantined one,
@@ -417,15 +419,13 @@ public class RemediationEngine {
             // blocked, stepping back to the nearest release the firewall allows is a real fix,
             // so the search continues downwards rather than giving up.
             List<String> downgrades = cap(downgradeCandidates(artifact));
-            replacement = availability.firstUsable(
+            downward = availability.findUsable(
                     artifact.getGroupId(), artifact.getArtifactId(), artifact.getExtension(), downgrades);
+            replacement = downward.usable();
             downgraded = replacement.isPresent();
 
             if (replacement.isEmpty()) {
-                notes.add(upgrades.isEmpty() && downgrades.isEmpty()
-                        ? policyExhaustedNote()
-                        : "no version the firewall allows: tried " + upgrades.size()
-                                + " newer and " + downgrades.size() + " older release(s)");
+                notes.addAll(explainNoUsableVersion(upward, downward, upgrades, downgrades));
                 return quarantineResult(artifact, probe, path, null,
                         ScanReport.Outcome.NO_WORKING_FIX, notes);
             }
@@ -461,6 +461,41 @@ public class RemediationEngine {
             notes.add("failed to write the POM: " + Log.describe(e));
             return quarantineResult(artifact, probe, path, version, ScanReport.Outcome.ERROR, notes);
         }
+    }
+
+    /**
+     * Spells out why no version could be used, listing what each one answered.
+     *
+     * <p>The distinction that matters: a firewall blocking every release of an artifact cannot be
+     * escaped by changing versions at all and needs a policy waiver, while one blocking a single
+     * release just needs a different number. Both used to print "no version worked".
+     */
+    private static List<String> explainNoUsableVersion(ArtifactAvailability.Search upward,
+                                                       ArtifactAvailability.Search downward,
+                                                       List<String> upgrades, List<String> downgrades) {
+        List<String> notes = new ArrayList<>();
+        if (upgrades.isEmpty() && downgrades.isEmpty()) {
+            notes.add("no other version is published under this coordinate — the artifact was "
+                    + "likely renamed or discontinued, so no version change can fix this");
+            return notes;
+        }
+
+        boolean everythingQuarantined = upward.allQuarantined()
+                && (downward == null || downward.allQuarantined());
+        if (everythingQuarantined) {
+            notes.add("EVERY published version is quarantined — the firewall blocks this artifact "
+                    + "as a whole, so no version change can fix it. Request a policy waiver, or "
+                    + "remove the dependency that pulls it in.");
+        } else {
+            notes.add("no version the firewall allows, among " + upgrades.size()
+                    + " newer and " + downgrades.size() + " older release(s)");
+        }
+
+        notes.add("checked (newer): " + upward.render(10));
+        if (downward != null) {
+            notes.add("checked (older): " + downward.render(10));
+        }
+        return notes;
     }
 
     /**
