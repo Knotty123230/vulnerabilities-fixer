@@ -23,6 +23,7 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -46,8 +47,28 @@ public class MavenPomFixer {
      * configuration as the resolver. Without a Nexus we leave OpenRewrite's default (Central).
      */
     private ExecutionContext createContext() {
-        ExecutionContext ctx = new InMemoryExecutionContext(
-                throwable -> Log.debug("OpenRewrite: %s", Log.describe(throwable)));
+        return createContext(null);
+    }
+
+    /**
+     * @param errorSink when non-null, collects every message OpenRewrite reports through its
+     *                  {@code onError} callback during this context's lifetime.
+     *
+     *                  <p>This callback is a second, independent place recipe failures go missing.
+     *                  It fires for problems a recipe treats as non-fatal — most commonly a POM or
+     *                  metadata file that could not be downloaded — and the recipe then simply
+     *                  produces no change rather than throwing. Without capturing it, "no recipe
+     *                  produced a change" is the only thing callers ever see, even when the real
+     *                  story is "OpenRewrite could not reach the artifact to verify it exists".
+     */
+    private ExecutionContext createContext(List<String> errorSink) {
+        ExecutionContext ctx = new InMemoryExecutionContext(throwable -> {
+            String message = Log.describe(throwable);
+            Log.debug("OpenRewrite: %s", message);
+            if (errorSink != null) {
+                errorSink.add(message);
+            }
+        });
         if (credentials == null) {
             return ctx;
         }
@@ -63,6 +84,14 @@ public class MavenPomFixer {
         mavenCtx.setRepositories(List.of(nexusRepo));
         mavenCtx.setAddCentralRepository(false);
         return ctx;
+    }
+
+    /** What OpenRewrite is actually configured to talk to — printed once, always visible. */
+    public String describeRepository() {
+        if (credentials == null) {
+            return "Maven Central (no private repository configured for OpenRewrite)";
+        }
+        return credentials.url() + (credentials.isAuthenticated() ? " (authenticated)" : " (anonymous)");
     }
 
     private List<SourceFile> parsePom(ExecutionContext ctx, Path pomFile) {
@@ -212,8 +241,9 @@ public class MavenPomFixer {
      */
     public OverridePreview previewManagedOverrideDetailed(File pomFile, String groupId, String artifactId,
                                                            String version, boolean onlyIfUsed) {
+        List<String> recipeErrors = new ArrayList<>();
         try {
-            ExecutionContext ctx = createContext();
+            ExecutionContext ctx = createContext(recipeErrors);
             List<SourceFile> docs = parsePom(ctx, pomFile.toPath());
 
             // An existing managed entry should be updated rather than duplicated.
@@ -244,10 +274,7 @@ public class MavenPomFixer {
                 return new OverridePreview(added, null);
             }
 
-            return new OverridePreview(null,
-                    "no recipe (upgrade, change-version, or add-managed-dependency) produced a change; "
-                            + "the artifact may already be pinned to this exact version elsewhere in a way "
-                            + "these recipes cannot see, or the POM's structure is blocking the edit");
+            return new OverridePreview(null, describeNoChange(recipeErrors, groupId, artifactId, version));
 
         } catch (Exception e) {
             // Visible without --verbose: an artifact this fails for has no other route to a fix,
@@ -256,6 +283,19 @@ public class MavenPomFixer {
                     groupId, artifactId, version, Log.describe(e));
             return new OverridePreview(null, "recipe execution threw: " + Log.describe(e));
         }
+    }
+
+    /** Explains a silent no-op, using whatever OpenRewrite itself reported along the way. */
+    private String describeNoChange(List<String> recipeErrors, String groupId, String artifactId, String version) {
+        if (!recipeErrors.isEmpty()) {
+            String detail = recipeErrors.stream().distinct().limit(3).reduce((a, b) -> a + " | " + b).orElse("");
+            Log.warn("OpenRewrite reported %d error(s) computing an edit for %s:%s -> %s: %s",
+                    recipeErrors.size(), groupId, artifactId, version, detail);
+            return "OpenRewrite could not compute the edit against " + describeRepository() + ": " + detail;
+        }
+        return "no recipe (upgrade, change-version, or add-managed-dependency) produced a change against "
+                + describeRepository() + "; the artifact may already be pinned to this exact version "
+                + "elsewhere in a way these recipes cannot see, or the POM's structure is blocking the edit";
     }
 
     /**

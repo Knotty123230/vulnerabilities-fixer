@@ -92,6 +92,9 @@ public class RemediationEngine {
         this.analyzer = new LocalProjectAnalyzer(repositorySystem, session, repositories);
         this.versionCatalog = new VersionCatalog(repositorySystem, session, repositories);
         this.pomFixer = new MavenPomFixer(resolvePomFixerCredentials(credentials, session, repositories));
+        // Always printed, not gated by --verbose: this is the one fact that settles whether
+        // OpenRewrite is even able to reach a private artifact before anything else is debugged.
+        Log.info("%-12s %s", "POM edits via", pomFixer.describeRepository());
         this.linkageAnalyzer = new LinkageAnalyzer(analyzer, projectPath);
         this.bomLocator = new BomLocator(repositorySystem, session, repositories, versionCatalog);
         this.skewDetector = new VersionSkewDetector(bomLocator);
