@@ -177,6 +177,19 @@ public class MavenPomFixer {
      * no other edit can reach. It is also the bluntest, which is why the engine reaches for it last.
      */
     public String previewManagedOverride(File pomFile, String groupId, String artifactId, String version) {
+        return previewManagedOverride(pomFile, groupId, artifactId, version, true);
+    }
+
+    /**
+     * @param onlyIfUsed when {@code true}, the managed entry is added only if the artifact is
+     *                   already somewhere in the project's dependency graph. That guard is right
+     *                   for a vulnerability pin — managing something the project never resolves is
+     *                   dead configuration — but wrong for an artifact the <em>build</em> pulls in
+     *                   outside the graph, such as a Quarkus deployment dependency. There the guard
+     *                   silently rejects the only edit that can unblock the build.
+     */
+    public String previewManagedOverride(File pomFile, String groupId, String artifactId, String version,
+                                         boolean onlyIfUsed) {
         try {
             ExecutionContext ctx = createContext();
             List<SourceFile> docs = parsePom(ctx, pomFile.toPath());
@@ -201,8 +214,9 @@ public class MavenPomFixer {
 
             return runRecipe(
                     new AddManagedDependency(groupId, artifactId, version,
-                            null, null, null, null, null, groupId + ":" + artifactId, null,
-                            "pinned by vulnchecker to remediate a known vulnerability"),
+                            null, null, null, null, null,
+                            onlyIfUsed ? groupId + ":" + artifactId : null, null,
+                            "pinned by vulnchecker"),
                     docs, ctx);
         } catch (Exception e) {
             Log.debug("Managed-override preview failed for %s:%s -> %s: %s",

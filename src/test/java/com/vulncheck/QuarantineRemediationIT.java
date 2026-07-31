@@ -227,6 +227,57 @@ class QuarantineRemediationIT {
     }
 
     @Test
+    @DisplayName("pins an artifact the build needs but the dependency graph never mentions")
+    void pinsArtifactOutsideTheDependencyGraph(@TempDir Path projectDir) throws Exception {
+        assumeStubUsable();
+
+        // The Quarkus case: the blocked artifact is resolved by the build, not by <dependencies>.
+        // OpenRewrite's "only add if already used" guard cannot see such a classpath, so the edit
+        // has to be made unconditionally or the build stays broken.
+        Path pom = projectDir.resolve("pom.xml");
+        Files.writeString(pom, """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <project xmlns="http://maven.apache.org/POM/4.0.0"><modelVersion>4.0.0</modelVersion>
+                <groupId>com.example</groupId><artifactId>svc</artifactId><version>1.0.0</version>
+                <dependencies><dependency><groupId>commons-io</groupId>
+                <artifactId>commons-io</artifactId><version>2.16.1</version></dependency></dependencies>
+                </project>
+                """);
+
+        String log = "Could not transfer artifact org.apache.commons:commons-text:jar:1.10.0 "
+                + "from/to nexus: status code: 403, reason phrase: REQUESTED ITEM IS QUARANTINED "
+                + "SEE https://iq.example.com/ui/links/firewall/repositories/quarantinedComponent/XYZ";
+
+        ScanReport report = runEngineWithBuildLog(projectDir, log);
+
+        assertEquals(1, report.quarantined().size(), report.quarantined().toString());
+        ScanReport.QuarantinedComponent component = report.quarantined().getFirst();
+
+        assertEquals(ScanReport.Outcome.FIXED, component.outcome(), () -> component.notes().toString());
+        assertTrue(component.notes().stream().anyMatch(n -> n.contains("not in the dependency graph")),
+                component.notes().toString());
+
+        String rewritten = Files.readString(pom);
+        assertTrue(rewritten.contains("dependencyManagement"), rewritten);
+        assertTrue(rewritten.contains("commons-text"), rewritten);
+    }
+
+    private ScanReport runEngineWithBuildLog(Path projectDir, String buildLog) throws Exception {
+        NexusCredentials credentials = new NexusCredentials(baseUrl, null, null);
+        RepositorySystem system = MavenResolverFactory.createRepositorySystem();
+        RepositorySystemSession session = MavenResolverFactory.createSession(
+                system, sharedLocalRepository, credentials, null);
+        List<RemoteRepository> repositories =
+                MavenResolverFactory.createRepositories(system, session, credentials, null);
+
+        return new RemediationEngine(SonatypeScanReport.none(), system, session, repositories,
+                credentials, projectDir,
+                new RemediationEngine.Options(VersionPolicy.UpgradeScope.MINOR, false, false, 3,
+                        false, true, false, buildLog, null, 5))
+                .run(projectDir.resolve("pom.xml").toFile());
+    }
+
+    @Test
     @DisplayName("a quarantined component fails the gate no matter the severity threshold")
     void quarantineIsBlocking(@TempDir Path projectDir) throws Exception {
         assumeStubUsable();

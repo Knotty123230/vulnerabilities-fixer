@@ -438,8 +438,10 @@ public class RemediationEngine {
                     + " — no allowed newer release exists. Verify API compatibility, and note that "
                     + "an older release may carry vulnerabilities of its own.");
         }
+        // An artifact absent from the graph must be managed unconditionally: OpenRewrite's
+        // "only if used" guard cannot see a build-time classpath and would drop the edit.
         String pomContent = pomFixer.previewManagedOverride(
-                pomFile, artifact.getGroupId(), artifact.getArtifactId(), version);
+                pomFile, artifact.getGroupId(), artifact.getArtifactId(), version, !paths.isEmpty());
         if (pomContent == null) {
             notes.add("could not express a version override for this artifact");
             return quarantineResult(artifact, probe, path, version, ScanReport.Outcome.NO_WORKING_FIX, notes);
