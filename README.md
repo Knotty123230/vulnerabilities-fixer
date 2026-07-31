@@ -56,6 +56,20 @@ java -jar vulnchecker.jar -p /path/to/project --scan-sonatype --dry-run
 Always start with `--dry-run`. It performs the entire analysis, including verification, and
 reports exactly what it would change without touching a file.
 
+`--scan-sonatype` is what finds vulnerabilities. The graph-based checks — `--fix-quarantined` and
+`--align-families` — read the dependency tree directly and work without it:
+
+```bash
+java -jar vulnchecker.jar -p . --fix-quarantined --align-families --dry-run
+```
+
+### What runs, in order
+
+1. **Repository firewall** (`--fix-quarantined`) — a quarantined component blocks the build, so it
+   is cleared before anything else looks at the graph.
+2. **Vulnerabilities** (`--scan-sonatype`) — one verified fix per component.
+3. **Version skew** — always detected; aligned via BOM import with `--align-families`.
+
 ### Options that matter
 
 | Option | Default | Purpose |
@@ -196,6 +210,29 @@ Disable with `--no-check-quarantine`.
 **Opt-in: `--fix-quarantined`.** Probes every resolved artifact and pins each quarantined one to
 the nearest version the firewall serves. This downloads the classpath — the same work the build
 would do — which is why it is not on by default.
+
+It runs **before** everything else, and works **without a vulnerability scan**:
+
+```bash
+# No Sonatype needed — this reads the dependency graph directly
+java -jar vulnchecker.jar -p . --fix-quarantined --dry-run
+```
+
+Both properties matter for a build that is already broken. A quarantined component stops
+resolution, so it outranks every CVE in the report and has to be cleared before anything else can
+be analysed; and a project the firewall is blocking usually cannot be scanned at all, because the
+scanner has to resolve it first. Requiring `--scan-sonatype` here would have made the feature
+unusable in exactly the situation it exists for.
+
+If a quarantined POM makes the graph unresolvable outright, the failure is restated in plain terms
+rather than as a stack of nested Aether exceptions:
+
+```
+ERROR The dependency graph cannot be resolved: org.jetbrains.kotlinx:kotlinx-metadata-jvm:jar:0.9.0
+      is quarantined by the repository firewall (https://iq.../quarantinedComponent/...).
+      Nothing can be analysed until it is released or replaced — either request a policy waiver,
+      or pin an allowed version by hand and re-run.
+```
 
 ```
 QUARANTINED BY REPOSITORY FIREWALL (1)

@@ -105,7 +105,14 @@ public final class ConsoleReportRenderer {
         if (report.sonatypeReportUrl() != null) {
             field("Scan report", report.sonatypeReportUrl());
         }
-        field("Components", report.componentsScanned() + " scanned, " + report.findings().size() + " vulnerable");
+        if (report.componentsScanned() > 0 || !report.findings().isEmpty()) {
+            field("Components", report.componentsScanned() + " scanned, "
+                    + report.findings().size() + " vulnerable");
+        } else {
+            // A graph-only run (--fix-quarantined / --align-families) has no scan behind it;
+            // printing "0 scanned, 0 vulnerable" would read as a clean bill of health.
+            field("Mode", "dependency graph only (no vulnerability scan)");
+        }
         field("Policy", report.upgradeScope() + (report.dryRun() ? Log.yellow(" · dry-run (no files written)") : ""));
         field("Duration", humanDuration(report.duration()));
     }

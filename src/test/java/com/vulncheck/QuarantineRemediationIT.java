@@ -56,6 +56,14 @@ class QuarantineRemediationIT {
             .connectTimeout(Duration.ofSeconds(20))
             .build();
 
+    /**
+     * One local repository for the whole class. A per-test repository forced every POM and JAR to
+     * be fetched again through the stub, which dominated the runtime; the quarantined artifact is
+     * never cached because it never downloads, so sharing does not weaken the test.
+     */
+    @TempDir(cleanup = org.junit.jupiter.api.io.CleanupMode.ALWAYS)
+    static Path sharedLocalRepository;
+
     private HttpServer server;
     private ExecutorService serverPool;
     private String baseUrl;
@@ -190,7 +198,7 @@ class QuarantineRemediationIT {
         RepositorySystem system = MavenResolverFactory.createRepositorySystem();
         // A private local repository, so nothing is answered from an earlier download.
         RepositorySystemSession session = MavenResolverFactory.createSession(
-                system, projectDir.resolve("local-repo"), credentials, null);
+                system, sharedLocalRepository, credentials, null);
         List<RemoteRepository> repositories =
                 MavenResolverFactory.createRepositories(system, session, credentials, null);
 

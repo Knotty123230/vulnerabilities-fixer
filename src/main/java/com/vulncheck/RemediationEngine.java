@@ -96,8 +96,20 @@ public class RemediationEngine {
         Instant startedAt = Instant.now();
 
         Log.section("Resolving dependency graph");
-        DependencyNode graph = analyzer.buildGraphFromPom(pomFile);
+        DependencyNode graph = buildGraphOrExplain(pomFile);
         Log.step("Resolved %d direct dependencies", graph.getChildren().size());
+
+        // The firewall runs first, before anything else looks at the graph. A quarantined
+        // component stops the build outright, so it outranks every vulnerability in the report —
+        // and clearing it produces the resolvable graph the remediation pass then reasons about.
+        List<ScanReport.QuarantinedComponent> quarantined = List.of();
+        if (options.fixQuarantined()) {
+            quarantined = handleQuarantine(pomFile, graph);
+            if (quarantined.stream().anyMatch(c -> c.outcome() == ScanReport.Outcome.FIXED)) {
+                analyzer.invalidate(pomFile);
+                graph = buildGraphOrExplain(pomFile);
+            }
+        }
 
         List<ScanReport.Finding> findings = new ArrayList<>();
         List<SonatypeScanReport.VulnerabilityDetails> vulnerabilities = report.vulnerabilities();
@@ -130,15 +142,6 @@ public class RemediationEngine {
             }
         }
 
-        List<ScanReport.QuarantinedComponent> quarantined = List.of();
-        if (options.fixQuarantined()) {
-            quarantined = handleQuarantine(pomFile, graph);
-            if (quarantined.stream().anyMatch(c -> c.outcome() == ScanReport.Outcome.FIXED)) {
-                analyzer.invalidate(pomFile);
-                graph = analyzer.buildGraphFromPom(pomFile);
-            }
-        }
-
         // Skew is assessed on the final graph, so a family that the fixes happened to align
         // is not reported as an outstanding problem.
         Log.section("Checking for version skew");
@@ -168,6 +171,42 @@ public class RemediationEngine {
     // ------------------------------------------------------------------
     // Repository firewall quarantine
     // ------------------------------------------------------------------
+
+    /**
+     * Builds the graph, translating a firewall refusal into something actionable.
+     *
+     * <p>When a POM in the tree is quarantined, resolution fails before any analysis can start and
+     * the raw Aether failure is a wall of nested exceptions. Since that is the exact situation this
+     * tool exists to help with, the failure is restated as what it is, with the quarantine link and
+     * the two ways out.
+     */
+    private DependencyNode buildGraphOrExplain(File pomFile) throws Exception {
+        try {
+            return analyzer.buildGraphFromPom(pomFile);
+        } catch (Exception failure) {
+            QuarantineDetector.Verdict verdict = QuarantineDetector.inspect(failure);
+            if (!verdict.quarantined()) {
+                throw failure;
+            }
+            String artifact = extractArtifactCoordinate(failure);
+            throw new IllegalStateException(
+                    "The dependency graph cannot be resolved: "
+                            + (artifact == null ? "a component" : artifact)
+                            + " is quarantined by the repository firewall"
+                            + (verdict.quarantineUrl() == null ? "" : " (" + verdict.quarantineUrl() + ")")
+                            + ". Nothing can be analysed until it is released or replaced — either "
+                            + "request a policy waiver, or pin an allowed version by hand and re-run.",
+                    failure);
+        }
+    }
+
+    /** Pulls {@code group:artifact:type:version} out of an Aether transfer message. */
+    private static String extractArtifactCoordinate(Throwable failure) {
+        java.util.regex.Matcher matcher = java.util.regex.Pattern
+                .compile("artifact ([\\w.\\-]+:[\\w.\\-]+:[\\w.\\-]+:[\\w.\\-]+)")
+                .matcher(Log.describe(failure));
+        return matcher.find() ? matcher.group(1) : null;
+    }
 
     /**
      * Finds components the repository firewall refuses to serve and moves them to a version it

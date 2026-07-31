@@ -12,6 +12,14 @@ public record SonatypeScanReport(
         int vulnerableComponents,
         List<VulnerabilityDetails> vulnerabilities
 ) {
+
+    /**
+     * An empty report, for runs that analyse the dependency graph without a vulnerability scan
+     * ({@code --fix-quarantined}, {@code --align-families}).
+     */
+    public static SonatypeScanReport none() {
+        return new SonatypeScanReport(null, null, null, 0, 0, List.of());
+    }
     public record VulnerabilityDetails(
             String packageUrl,
             String displayName,

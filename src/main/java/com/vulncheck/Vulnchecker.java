@@ -231,8 +231,17 @@ public class Vulnchecker implements Callable<Integer> {
 
             SonatypeScanReport scanReport = obtainScanReport();
             if (scanReport == null) {
-                Log.error("No vulnerability data. Pass --scan-sonatype to run a Sonatype Lifecycle evaluation.");
-                return EXIT_ERROR;
+                // Quarantine and version-skew checks read the dependency graph directly, so they
+                // are useful on their own — and a project blocked by the firewall usually cannot
+                // be scanned at all, since the scanner has to resolve it first.
+                if (!fixQuarantined && !alignFamilies) {
+                    Log.error("Nothing to do. Pass --scan-sonatype to check for vulnerabilities, "
+                            + "or --fix-quarantined / --align-families to work from the "
+                            + "dependency graph alone.");
+                    return EXIT_ERROR;
+                }
+                Log.info("No vulnerability scan requested; analysing the dependency graph only.");
+                scanReport = SonatypeScanReport.none();
             }
 
             ScanReport report = remediate(pomFile, credentials, scanReport);
