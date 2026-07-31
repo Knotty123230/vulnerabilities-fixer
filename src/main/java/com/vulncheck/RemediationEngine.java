@@ -479,12 +479,13 @@ public class RemediationEngine {
         }
         // An artifact absent from the graph must be managed unconditionally: OpenRewrite's
         // "only if used" guard cannot see a build-time classpath and would drop the edit.
-        String pomContent = pomFixer.previewManagedOverride(
+        MavenPomFixer.OverridePreview override = pomFixer.previewManagedOverrideDetailed(
                 pomFile, artifact.getGroupId(), artifact.getArtifactId(), version, !paths.isEmpty());
-        if (pomContent == null) {
-            notes.add("could not express a version override for this artifact");
+        if (!override.succeeded()) {
+            notes.add("could not express a version override for this artifact: " + override.failureReason());
             return quarantineResult(artifact, probe, path, version, ScanReport.Outcome.NO_WORKING_FIX, notes);
         }
+        String pomContent = override.content();
 
         notes.add("pinned to the nearest version the firewall allows");
         if (options.dryRun()) {

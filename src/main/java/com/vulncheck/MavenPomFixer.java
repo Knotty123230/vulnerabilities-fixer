@@ -190,6 +190,28 @@ public class MavenPomFixer {
      */
     public String previewManagedOverride(File pomFile, String groupId, String artifactId, String version,
                                          boolean onlyIfUsed) {
+        return previewManagedOverrideDetailed(pomFile, groupId, artifactId, version, onlyIfUsed).content();
+    }
+
+    /** Outcome of {@link #previewManagedOverrideDetailed}: the rewritten POM, or why there is none. */
+    public record OverridePreview(String content, String failureReason) {
+        public boolean succeeded() {
+            return content != null;
+        }
+    }
+
+    /**
+     * Same as {@link #previewManagedOverride}, but reports <em>why</em> nothing changed instead of a
+     * bare {@code null}.
+     *
+     * <p>A quarantined artifact this method cannot pin is one whose only remaining fix is a firewall
+     * waiver, not another version — that is a real, actionable conclusion, and the reason it could
+     * not be pinned belongs in the report a person actually reads, not only behind {@code --verbose}.
+     * Silently losing it here is exactly what turned one blocked build into several rounds of
+     * guessing.
+     */
+    public OverridePreview previewManagedOverrideDetailed(File pomFile, String groupId, String artifactId,
+                                                           String version, boolean onlyIfUsed) {
         try {
             ExecutionContext ctx = createContext();
             List<SourceFile> docs = parsePom(ctx, pomFile.toPath());
@@ -198,7 +220,7 @@ public class MavenPomFixer {
             String upgraded = runRecipe(
                     new UpgradeDependencyVersion(groupId, artifactId, version, null, true, null), docs, ctx);
             if (upgraded != null) {
-                return upgraded;
+                return new OverridePreview(upgraded, null);
             }
 
             // UpgradeDependencyVersion only ever moves a version forward, so a declared dependency
@@ -209,20 +231,31 @@ public class MavenPomFixer {
                             groupId, artifactId, groupId, artifactId, version, null, true, true),
                     docs, ctx);
             if (changed != null) {
-                return changed;
+                return new OverridePreview(changed, null);
             }
 
-            return runRecipe(
+            String added = runRecipe(
                     new AddManagedDependency(groupId, artifactId, version,
                             null, null, null, null, null,
                             onlyIfUsed ? groupId + ":" + artifactId : null, null,
                             "pinned by vulnchecker"),
                     docs, ctx);
+            if (added != null) {
+                return new OverridePreview(added, null);
+            }
+
+            return new OverridePreview(null,
+                    "no recipe (upgrade, change-version, or add-managed-dependency) produced a change; "
+                            + "the artifact may already be pinned to this exact version elsewhere in a way "
+                            + "these recipes cannot see, or the POM's structure is blocking the edit");
+
         } catch (Exception e) {
-            Log.debug("Managed-override preview failed for %s:%s -> %s: %s",
+            // Visible without --verbose: an artifact this fails for has no other route to a fix,
+            // and burying the reason behind a debug flag is what cost real time diagnosing this.
+            Log.warn("Managed-override preview failed for %s:%s -> %s: %s",
                     groupId, artifactId, version, Log.describe(e));
+            return new OverridePreview(null, "recipe execution threw: " + Log.describe(e));
         }
-        return null;
     }
 
     /**
