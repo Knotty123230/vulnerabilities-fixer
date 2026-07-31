@@ -20,29 +20,99 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * Finds the bill-of-materials that governs a family of artifacts.
  *
- * <p>There is no standard mapping from a groupId to its BOM, so candidates are guessed from
- * naming convention plus a small curated table, and then <b>verified by reading the descriptor</b>.
- * Verification is the important half: {@code io.netty:netty-bom} exists, but
+ * <p>There is no standard mapping from a groupId to its BOM, so candidates come from three sources,
+ * tried in order of how cheap and how likely each one is to be right:
+ * <ol>
+ *   <li><b>Naming convention</b> — {@code io.netty} → {@code io.netty:netty-bom}. Free, and
+ *       correct often enough to be worth trying first.</li>
+ *   <li><b>A curated table</b> — for well-known publishers whose BOM lives under a different
+ *       groupId or a name convention would not guess (Jackson, Spring Boot, AWS, ...).</li>
+ *   <li><b>{@link MavenCentralBomSearch}</b> — when neither of the above finds anything, search
+ *       Central directly for {@code pom}-packaged, BOM-shaped artifacts under the target's groupId
+ *       and its ancestors. This is what actually scales to "every BOM that exists": the curated
+ *       table only ever covers what someone thought to add to it, while the search generalises
+ *       from where BOMs conventionally live relative to what they manage.</li>
+ * </ol>
+ *
+ * <p>None of that is trusted on its own — every candidate is <b>verified by reading its
+ * descriptor</b>. Verification is the important half: {@code io.netty:netty-bom} exists, but
  * {@code ch.qos.logback} publishes {@code logback-parent} — a parent POM, not a curated BOM — and
- * a convention-only guess would happily import something that manages nothing we care about.
+ * an unverified guess would happily import something that manages nothing we care about.
  */
 public final class BomLocator {
 
-    /** Coordinates that convention alone would not find. */
+    /**
+     * Coordinates for well-known publishers that naming convention would not find on its own —
+     * typically because the BOM lives under a different (usually shorter, ancestor) groupId than
+     * the artifacts it manages, or uses a name that does not follow the {@code -bom} pattern.
+     *
+     * <p>This list is deliberately not exhaustive — {@link MavenCentralBomSearch} exists precisely
+     * so it does not need to be. It exists to skip a network round trip for the publishers a scan
+     * runs into constantly.
+     */
     private static final Map<String, String> KNOWN_BOMS = Map.ofEntries(
+            // Jackson: BOM groupId is the ancestor of every module's own groupId.
             Map.entry("com.fasterxml.jackson.core", "com.fasterxml.jackson:jackson-bom"),
             Map.entry("com.fasterxml.jackson.datatype", "com.fasterxml.jackson:jackson-bom"),
             Map.entry("com.fasterxml.jackson.dataformat", "com.fasterxml.jackson:jackson-bom"),
             Map.entry("com.fasterxml.jackson.module", "com.fasterxml.jackson:jackson-bom"),
+            Map.entry("com.fasterxml.jackson.jaxrs", "com.fasterxml.jackson:jackson-bom"),
+            Map.entry("com.fasterxml.jackson.jr", "com.fasterxml.jackson:jackson-bom"),
+
+            // Spring ecosystem: each project publishes its own BOM under its own groupId, and the
+            // name is "-dependencies" or "-bom" depending on the project, not one single pattern.
             Map.entry("org.springframework", "org.springframework:spring-framework-bom"),
+            Map.entry("org.springframework.boot", "org.springframework.boot:spring-boot-dependencies"),
+            Map.entry("org.springframework.cloud", "org.springframework.cloud:spring-cloud-dependencies"),
+            Map.entry("org.springframework.security", "org.springframework.security:spring-security-bom"),
+            Map.entry("org.springframework.integration", "org.springframework.integration:spring-integration-bom"),
+
+            // JUnit 5: BOM groupId "org.junit" is the ancestor of jupiter/platform/vintage.
+            Map.entry("org.junit.jupiter", "org.junit:junit-bom"),
+            Map.entry("org.junit.platform", "org.junit:junit-bom"),
+            Map.entry("org.junit.vintage", "org.junit:junit-bom"),
+
+            // Cloud SDKs: each vendor's BOM artifactId does not follow a shared pattern.
+            Map.entry("software.amazon.awssdk", "software.amazon.awssdk:bom"),
+            Map.entry("com.amazonaws", "com.amazonaws:aws-java-sdk-bom"),
+            Map.entry("com.google.cloud", "com.google.cloud:libraries-bom"),
+            Map.entry("com.azure", "com.azure:azure-sdk-bom"),
+
+            // Kotlin: BOM lives under the same groupId as the compiler/stdlib artifacts.
+            Map.entry("org.jetbrains.kotlin", "org.jetbrains.kotlin:kotlin-bom"),
+            // A separate, differently-versioned family under the same top-level org.
+            Map.entry("org.jetbrains.kotlinx", "org.jetbrains.kotlinx:kotlinx-coroutines-bom"),
+
+            // Frameworks whose BOM name breaks the "-bom" convention outright.
+            Map.entry("io.vertx", "io.vertx:vertx-stack-depchain"),
+            Map.entry("io.micronaut", "io.micronaut.platform:micronaut-platform"),
+            Map.entry("io.quarkus", "io.quarkus:quarkus-bom"),
+            Map.entry("jakarta.platform", "jakarta.platform:jakarta.jakartaee-bom"),
+
+            // Widely-used libraries whose BOM naming convention alone would still find, but that
+            // are common enough to be worth skipping the network round trip for.
             Map.entry("io.netty", "io.netty:netty-bom"),
             Map.entry("org.slf4j", "org.slf4j:slf4j-bom"),
             Map.entry("io.grpc", "io.grpc:grpc-bom"),
             Map.entry("com.google.protobuf", "com.google.protobuf:protobuf-bom"),
             Map.entry("io.projectreactor", "io.projectreactor:reactor-bom"),
-            Map.entry("org.junit.jupiter", "org.junit:junit-bom"),
+            Map.entry("io.projectreactor.netty", "io.projectreactor:reactor-bom"),
             Map.entry("org.testcontainers", "org.testcontainers:testcontainers-bom"),
-            Map.entry("software.amazon.awssdk", "software.amazon.awssdk:bom"));
+            Map.entry("org.mockito", "org.mockito:mockito-bom"),
+            Map.entry("org.assertj", "org.assertj:assertj-bom"),
+            Map.entry("io.cucumber", "io.cucumber:cucumber-bom"),
+            Map.entry("org.apache.logging.log4j", "org.apache.logging.log4j:log4j-bom"),
+            Map.entry("io.opentelemetry", "io.opentelemetry:opentelemetry-bom"),
+            Map.entry("io.micrometer", "io.micrometer:micrometer-bom"),
+            Map.entry("io.github.resilience4j", "io.github.resilience4j:resilience4j-bom"),
+            Map.entry("org.glassfish.jersey", "org.glassfish.jersey:jersey-bom"),
+            Map.entry("org.jboss.resteasy", "org.jboss.resteasy:resteasy-bom"),
+            Map.entry("org.apache.cxf", "org.apache.cxf:cxf-bom"),
+            Map.entry("org.apache.camel", "org.apache.camel:camel-bom"),
+            Map.entry("io.dropwizard.metrics", "io.dropwizard.metrics:metrics-bom"),
+            Map.entry("org.mongodb", "org.mongodb:mongodb-driver-bom"),
+            Map.entry("com.datastax.oss", "com.datastax.oss:java-driver-bom"),
+            Map.entry("com.vaadin", "com.vaadin:vaadin-bom"));
 
     /** A BOM together with the versions it pins, keyed by {@code group:artifact}. */
     public record Bom(String groupId, String artifactId, String version, Map<String, String> managedVersions) {
@@ -68,6 +138,7 @@ public final class BomLocator {
     private final RepositorySystemSession session;
     private final List<RemoteRepository> repositories;
     private final VersionCatalog versionCatalog;
+    private final MavenCentralBomSearch centralSearch = new MavenCentralBomSearch();
 
     /** Descriptor reads are network calls; a scan asks for the same BOM many times. */
     private final Map<String, Optional<Bom>> descriptorCache = new ConcurrentHashMap<>();
@@ -129,15 +200,40 @@ public final class BomLocator {
      */
     public Optional<Bom> findFor(String groupId, Set<String> artifactIds, String preferredVersion) {
         for (String coordinate : candidateCoordinates(groupId, artifactIds)) {
-            String[] parts = coordinate.split(":");
-            Optional<Bom> bom = load(parts[0], parts[1], preferredVersion);
-            if (bom.isPresent() && managesAll(bom.get(), groupId, artifactIds)) {
-                Log.debug("BOM for %s: %s", groupId, bom.get().gav());
+            Optional<Bom> bom = tryCandidate(coordinate, groupId, artifactIds, preferredVersion);
+            if (bom.isPresent()) {
+                Log.debug("BOM for %s: %s (convention or curated table)", groupId, bom.get().gav());
                 return bom;
             }
         }
-        Log.debug("No BOM found that manages %s:%s", groupId, artifactIds);
+
+        // Neither convention nor the curated table found a working candidate. Rather than give up,
+        // ask Maven Central directly — this is what makes the lookup cover BOMs nobody thought to
+        // add to the table, at the cost of one search request per ancestor groupId (cached, and
+        // only reached for groups a scan has already flagged as genuinely skewed).
+        for (String groupIdToSearch : MavenCentralBomSearch.groupIdAndAncestors(groupId)) {
+            for (String coordinate : centralSearch.findBomShapedArtifacts(groupIdToSearch)) {
+                Optional<Bom> bom = tryCandidate(coordinate, groupId, artifactIds, preferredVersion);
+                if (bom.isPresent()) {
+                    Log.debug("BOM for %s: %s (found via Maven Central search)", groupId, bom.get().gav());
+                    return bom;
+                }
+            }
+        }
+
+        Log.debug("No BOM found that manages %s:%s (tried convention, curated table, and search)",
+                groupId, artifactIds);
         return Optional.empty();
+    }
+
+    private Optional<Bom> tryCandidate(String coordinate, String groupId, Set<String> artifactIds,
+                                       String preferredVersion) {
+        String[] parts = coordinate.split(":");
+        if (parts.length != 2) {
+            return Optional.empty();
+        }
+        Optional<Bom> bom = load(parts[0], parts[1], preferredVersion);
+        return bom.filter(candidate -> managesAll(candidate, groupId, artifactIds));
     }
 
     private static boolean managesAll(Bom bom, String groupId, Set<String> artifactIds) {

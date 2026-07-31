@@ -1,10 +1,5 @@
 package com.vulncheck;
 
-import org.apache.maven.model.Dependency;
-import org.apache.maven.model.DependencyManagement;
-import org.apache.maven.model.Model;
-import org.apache.maven.model.io.xpp3.MavenXpp3Reader;
-import org.apache.maven.model.io.xpp3.MavenXpp3Writer;
 import org.eclipse.aether.artifact.Artifact;
 import org.openrewrite.ExecutionContext;
 import org.openrewrite.InMemoryExecutionContext;
@@ -26,14 +21,13 @@ import org.openrewrite.tree.ParseError;
 
 import java.io.File;
 import java.io.IOException;
-import java.io.Reader;
-import java.io.StringWriter;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Produces edited POM content via OpenRewrite recipes.
@@ -313,48 +307,132 @@ public class MavenPomFixer {
      * Adds or updates a {@code dependencyManagement} entry by editing the raw Maven model,
      * bypassing OpenRewrite's recipe engine entirely.
      *
-     * <p>Trades OpenRewrite's format-preserving diff (comments, formatting, element order) for a
-     * guaranteed write — the right trade when the alternative is not being able to express the edit
-     * at all. Only reached for artifacts outside the project's own dependency model, so the diff
-     * cost lands on an entry a human was never going to hand-tune anyway.
+     * <p>This is deliberately a text-level edit, not a parse-model-and-reserialize round trip.
+     * A model-based writer (e.g. {@code MavenXpp3Writer}) reconstructs the <em>entire</em> document
+     * from its in-memory model — reordering elements to schema order, losing comments, and
+     * reformatting whitespace throughout. For a change that should be five inserted lines, that
+     * turns the diff into the whole file, which is unreviewable and defeats the purpose of a
+     * targeted fix. Everything outside the touched dependency (or the inserted block) is copied
+     * through byte-for-byte.
      */
     /* package */ String addOrUpdateManagedDependencyRaw(File pomFile, String groupId, String artifactId,
                                                           String version) {
         try {
-            MavenXpp3Reader reader = new MavenXpp3Reader();
-            Model model;
-            try (Reader in = Files.newBufferedReader(pomFile.toPath(), StandardCharsets.UTF_8)) {
-                model = reader.read(in);
+            String original = Files.readString(pomFile.toPath(), StandardCharsets.UTF_8);
+            String lineEnding = original.contains("\r\n") ? "\r\n" : "\n";
+
+            Matcher dmMatcher = DEPENDENCY_MANAGEMENT_BLOCK.matcher(original);
+            if (dmMatcher.find()) {
+                String updatedBlock = updateOrInsertInManagementBlock(
+                        dmMatcher.group(0), groupId, artifactId, version, lineEnding);
+                if (updatedBlock == null) {
+                    return null;
+                }
+                return original.substring(0, dmMatcher.start())
+                        + updatedBlock
+                        + original.substring(dmMatcher.end());
             }
 
-            if (model.getDependencyManagement() == null) {
-                model.setDependencyManagement(new DependencyManagement());
+            int insertionPoint = findInsertionPointForNewManagementBlock(original);
+            if (insertionPoint < 0) {
+                return null;
             }
-            List<Dependency> managed = model.getDependencyManagement().getDependencies();
-
-            Optional<Dependency> existing = managed.stream()
-                    .filter(d -> groupId.equals(d.getGroupId()) && artifactId.equals(d.getArtifactId()))
-                    .findFirst();
-
-            if (existing.isPresent()) {
-                existing.get().setVersion(version);
-            } else {
-                Dependency dependency = new Dependency();
-                dependency.setGroupId(groupId);
-                dependency.setArtifactId(artifactId);
-                dependency.setVersion(version);
-                managed.add(dependency);
-            }
-
-            StringWriter writer = new StringWriter();
-            new MavenXpp3Writer().write(writer, model);
-            return writer.toString();
+            String indent = detectIndent(original);
+            String newBlock = buildManagementBlock(groupId, artifactId, version, indent, lineEnding);
+            return original.substring(0, insertionPoint) + newBlock + original.substring(insertionPoint);
 
         } catch (Exception e) {
             Log.warn("Raw managed-dependency fallback failed for %s:%s -> %s: %s",
                     groupId, artifactId, version, Log.describe(e));
             return null;
         }
+    }
+
+    private static final Pattern DEPENDENCY_MANAGEMENT_BLOCK = Pattern.compile(
+            "[ \\t]*<dependencyManagement>.*?</dependencyManagement>[ \\t]*\\R?", Pattern.DOTALL);
+
+    /**
+     * Edits an existing {@code <dependencyManagement>} block: updates the {@code <version>} in
+     * place if {@code groupId:artifactId} is already managed there, otherwise inserts a new
+     * {@code <dependency>} entry right after the block's {@code <dependencies>} tag.
+     *
+     * @return the rewritten block, or {@code null} if the block has no {@code <dependencies>} child
+     *         to anchor an insertion to (malformed enough that guessing would be unsafe)
+     */
+    private static String updateOrInsertInManagementBlock(String dmBlock, String groupId, String artifactId,
+                                                           String version, String lineEnding) {
+        Pattern existingDependency = Pattern.compile(
+                "[ \\t]*<dependency>\\s*"
+                        + "<groupId>\\s*" + Pattern.quote(groupId) + "\\s*</groupId>\\s*"
+                        + "<artifactId>\\s*" + Pattern.quote(artifactId) + "\\s*</artifactId>\\s*"
+                        + "<version>[^<]*</version>.*?</dependency>[ \\t]*\\R?",
+                Pattern.DOTALL);
+        Matcher existing = existingDependency.matcher(dmBlock);
+        if (existing.find()) {
+            String updated = existing.group(0).replaceFirst(
+                    "<version>[^<]*</version>",
+                    Matcher.quoteReplacement("<version>" + version + "</version>"));
+            return dmBlock.substring(0, existing.start()) + updated + dmBlock.substring(existing.end());
+        }
+
+        Matcher dependenciesOpen = Pattern.compile("<dependencies>\\s*\\R?").matcher(dmBlock);
+        if (!dependenciesOpen.find()) {
+            return null;
+        }
+        String indent = detectEntryIndent(dmBlock, dependenciesOpen.end());
+        String snippet = dependencyElement(groupId, artifactId, version, indent, lineEnding);
+        return dmBlock.substring(0, dependenciesOpen.end()) + snippet + dmBlock.substring(dependenciesOpen.end());
+    }
+
+    /** Indentation copied from the next sibling element, or a sensible default if there is none. */
+    private static String detectEntryIndent(String block, int searchFrom) {
+        Matcher indentOfNextTag = Pattern.compile("\\R([ \\t]*)<").matcher(block);
+        if (indentOfNextTag.find(searchFrom)) {
+            return indentOfNextTag.group(1);
+        }
+        return "      ";
+    }
+
+    /** Indentation used by the first indented element in the document, or a two-space default. */
+    private static String detectIndent(String pom) {
+        Matcher m = Pattern.compile("(?m)^([ \\t]+)<\\w").matcher(pom);
+        return m.find() ? m.group(1) : "  ";
+    }
+
+    /**
+     * Where to insert a brand-new {@code <dependencyManagement>} when the POM has none: right
+     * before the project's own {@code <dependencies>}, matching where a person would put it, or
+     * failing that just before {@code </project>}.
+     */
+    private static int findInsertionPointForNewManagementBlock(String pom) {
+        Matcher dependencies = Pattern.compile("(?m)^[ \\t]*<dependencies>").matcher(pom);
+        if (dependencies.find()) {
+            return dependencies.start();
+        }
+        Matcher properties = Pattern.compile("</properties>\\s*\\R").matcher(pom);
+        if (properties.find()) {
+            return properties.end();
+        }
+        int idx = pom.lastIndexOf("</project>");
+        return idx < 0 ? -1 : idx;
+    }
+
+    private static String buildManagementBlock(String groupId, String artifactId, String version,
+                                                String indent, String lineEnding) {
+        return indent + "<dependencyManagement>" + lineEnding
+                + indent + "  <dependencies>" + lineEnding
+                + dependencyElement(groupId, artifactId, version, indent + "    ", lineEnding)
+                + indent + "  </dependencies>" + lineEnding
+                + indent + "</dependencyManagement>" + lineEnding;
+    }
+
+    private static String dependencyElement(String groupId, String artifactId, String version,
+                                            String indent, String lineEnding) {
+        return indent + "<dependency>" + lineEnding
+                + indent + "  <groupId>" + groupId + "</groupId>" + lineEnding
+                + indent + "  <artifactId>" + artifactId + "</artifactId>" + lineEnding
+                + indent + "  <version>" + version + "</version>" + lineEnding
+                + indent + "</dependency>" + lineEnding;
     }
 
     /** Explains a silent no-op, using whatever OpenRewrite itself reported along the way. */
