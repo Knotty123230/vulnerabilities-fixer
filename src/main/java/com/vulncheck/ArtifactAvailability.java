@@ -8,12 +8,14 @@ import org.eclipse.aether.repository.RemoteRepository;
 import org.eclipse.aether.resolution.ArtifactRequest;
 import org.eclipse.aether.resolution.ArtifactResolutionException;
 
+import java.io.File;
 import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -153,6 +155,22 @@ public final class ArtifactAvailability {
             return new Result(Status.MISSING, null, "not present in the repository");
         }
         return new Result(Status.ERROR, null, Log.describe(failure));
+    }
+
+    /**
+     * The artifact's file in the local repository, resolving it if needed.
+     * Empty when it cannot be fetched — including when the firewall refuses it.
+     */
+    public Optional<Path> localFile(Artifact artifact) {
+        try {
+            return Optional.ofNullable(
+                    repositorySystem.resolveArtifact(session, new ArtifactRequest(artifact, repositories, null))
+                            .getArtifact().getFile())
+                    .map(File::toPath);
+        } catch (ArtifactResolutionException | RuntimeException e) {
+            Log.debug("Could not resolve %s for inspection: %s", artifact, e.getMessage());
+            return Optional.empty();
+        }
     }
 
     /**

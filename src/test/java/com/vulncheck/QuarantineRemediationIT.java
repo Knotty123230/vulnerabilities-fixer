@@ -208,7 +208,7 @@ class QuarantineRemediationIT {
                         allowMinor ? VersionPolicy.UpgradeScope.MINOR : VersionPolicy.UpgradeScope.PATCH,
                         // Three candidates is plenty here and keeps the probe count — and so the
                         // number of real downloads through the stub — bounded.
-                        false, false, 3, false, true, true))
+                        false, false, 3, false, true, true, null, null, 5))
                 .run(projectDir.resolve("pom.xml").toFile());
     }
 }

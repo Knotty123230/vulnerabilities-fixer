@@ -320,6 +320,23 @@ public class LocalProjectAnalyzer {
         return collectResult.getRoot();
     }
 
+    /** The fully inherited and interpolated model, as Maven itself would compute it. */
+    public Model readEffectiveModel(final File pomFile) throws ModelBuildingException {
+        return buildEffectiveModel(pomFile);
+    }
+
+    /**
+     * Collects the transitive dependencies of a single artifact that is not part of the project —
+     * used for classpaths a build assembles outside {@code <dependencies>}, such as Maven plugins
+     * or framework build-time extensions.
+     */
+    public DependencyNode collectFor(final Artifact artifact) throws DependencyCollectionException {
+        final CollectRequest request = new CollectRequest();
+        request.setRoot(new Dependency(artifact, JavaScopes.COMPILE));
+        request.setRepositories(repositories);
+        return repositorySystem.collectDependencies(repositorySystemSession, request).getRoot();
+    }
+
     private Model buildEffectiveModel(final File pomFile) throws ModelBuildingException {
         final ModelBuilder modelBuilder = new DefaultModelBuilderFactory().newInstance();
         final DefaultModelBuildingRequest request = new DefaultModelBuildingRequest();

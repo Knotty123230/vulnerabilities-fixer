@@ -38,10 +38,17 @@ public class RemediationEngine {
             int maxAttemptsPerStrategy,
             boolean alignFamilies,
             boolean checkQuarantine,
-            boolean fixQuarantined
+            boolean fixQuarantined,
+            /** Pre-captured Maven output to mine for quarantine failures; may be {@code null}. */
+            String buildLog,
+            /** Goals to run to discover quarantine failures live; {@code null} disables it. */
+            String buildGoals,
+            /** How many build/fix rounds to attempt — Maven reports one refusal at a time. */
+            int maxBuildRounds
     ) {
         public static Options defaults() {
-            return new Options(VersionPolicy.UpgradeScope.MINOR, false, false, 12, false, true, false);
+            return new Options(VersionPolicy.UpgradeScope.MINOR, false, false, 12, false, true, false,
+                    null, null, 5);
         }
     }
 
@@ -66,6 +73,7 @@ public class RemediationEngine {
     private final BomLocator bomLocator;
     private final VersionSkewDetector skewDetector;
     private final ArtifactAvailability availability;
+    private final BuildTimeArtifacts buildTimeArtifacts;
     private final Path projectPath;
     private final Options options;
 
@@ -86,6 +94,7 @@ public class RemediationEngine {
         this.bomLocator = new BomLocator(repositorySystem, session, repositories, versionCatalog);
         this.skewDetector = new VersionSkewDetector(bomLocator);
         this.availability = new ArtifactAvailability(repositorySystem, session, repositories, credentials);
+        this.buildTimeArtifacts = new BuildTimeArtifacts(analyzer, availability);
     }
 
     // ------------------------------------------------------------------
@@ -102,13 +111,20 @@ public class RemediationEngine {
         // The firewall runs first, before anything else looks at the graph. A quarantined
         // component stops the build outright, so it outranks every vulnerability in the report —
         // and clearing it produces the resolvable graph the remediation pass then reasons about.
-        List<ScanReport.QuarantinedComponent> quarantined = List.of();
+        List<ScanReport.QuarantinedComponent> quarantined = new ArrayList<>();
         if (options.fixQuarantined()) {
-            quarantined = handleQuarantine(pomFile, graph);
-            if (quarantined.stream().anyMatch(c -> c.outcome() == ScanReport.Outcome.FIXED)) {
-                analyzer.invalidate(pomFile);
-                graph = buildGraphOrExplain(pomFile);
-            }
+            quarantined.addAll(handleQuarantine(pomFile, graph));
+        }
+        if (options.buildLog() != null) {
+            quarantined.addAll(fixQuarantineFrom(
+                    pomFile, graph, BuildLogQuarantineScanner.scan(options.buildLog()), "build log"));
+        }
+        if (options.buildGoals() != null) {
+            quarantined.addAll(fixQuarantineByBuilding(pomFile, graph));
+        }
+        if (quarantined.stream().anyMatch(c -> c.outcome() == ScanReport.Outcome.FIXED)) {
+            analyzer.invalidate(pomFile);
+            graph = buildGraphOrExplain(pomFile);
         }
 
         List<ScanReport.Finding> findings = new ArrayList<>();
@@ -165,7 +181,90 @@ public class RemediationEngine {
                 report.totalComponents(),
                 List.copyOf(findings),
                 skews,
-                quarantined);
+                List.copyOf(quarantined));
+    }
+
+    /**
+     * Remediates artifacts the build itself reported as quarantined.
+     *
+     * <p>These need not appear in the dependency graph at all. A Quarkus augmentation classpath, a
+     * plugin's own dependencies, or a resolver that mediates versions differently can all demand an
+     * artifact the project never declares — which is exactly the case a POM-only scan reports as
+     * clean while {@code mvn install} fails.
+     */
+    private List<ScanReport.QuarantinedComponent> fixQuarantineFrom(
+            File pomFile, DependencyNode graph, List<BuildLogQuarantineScanner.Hit> hits, String origin) {
+
+        if (hits.isEmpty()) {
+            Log.debug("No quarantined artifacts named in the %s", origin);
+            return List.of();
+        }
+
+        List<ScanReport.QuarantinedComponent> results = new ArrayList<>();
+        for (BuildLogQuarantineScanner.Hit hit : hits) {
+            Log.step("%s %s %s", Log.red("quarantined"), hit.gav(), Log.dim("(from the " + origin + ")"));
+            ArtifactAvailability.Result probe = new ArtifactAvailability.Result(
+                    ArtifactAvailability.Status.QUARANTINED, hit.quarantineUrl(),
+                    "reported by the build");
+            results.add(remediateQuarantine(pomFile, graph, hit.artifact(), probe,
+                    "resolved by the build, not present in the dependency graph"));
+        }
+        return results;
+    }
+
+    /**
+     * Runs the build, fixes whatever the firewall blocked, and repeats.
+     *
+     * <p>Maven aborts at the first refusal, so a single run reveals a single artifact even when
+     * several are blocked. Looping is what actually unblocks a project — and re-running is also the
+     * only honest confirmation that a fix worked, since the build is the thing that has to succeed.
+     */
+    private List<ScanReport.QuarantinedComponent> fixQuarantineByBuilding(File pomFile, DependencyNode graph) {
+        Log.section("Probing the build for firewall failures");
+
+        MavenBuildRunner runner = new MavenBuildRunner(projectPath);
+        List<ScanReport.QuarantinedComponent> results = new ArrayList<>();
+        Set<String> alreadySeen = new LinkedHashSet<>();
+
+        for (int round = 1; round <= Math.max(1, options.maxBuildRounds()); round++) {
+            Log.step("Round %d: running `mvn %s`", round, options.buildGoals());
+            MavenBuildRunner.Result build = runner.run(options.buildGoals());
+
+            if (build.succeeded()) {
+                Log.step("%s", Log.green("Build resolved successfully — nothing blocked."));
+                break;
+            }
+
+            List<BuildLogQuarantineScanner.Hit> hits = BuildLogQuarantineScanner.scan(build.output()).stream()
+                    .filter(hit -> alreadySeen.add(hit.gav()))
+                    .toList();
+            if (hits.isEmpty()) {
+                // The build failed for some other reason — compilation, tests, anything. Not this
+                // tool's problem to diagnose, and silently retrying would just waste time.
+                Log.step("%s", Log.yellow(
+                        "Build failed, but not because of the repository firewall — stopping."));
+                Log.debug("Last 40 lines of build output:%n%s", lastLines(build.output(), 40));
+                break;
+            }
+
+            List<ScanReport.QuarantinedComponent> round1 =
+                    fixQuarantineFrom(pomFile, graph, hits, "build output");
+            results.addAll(round1);
+
+            if (round1.stream().noneMatch(c -> c.outcome() == ScanReport.Outcome.FIXED)) {
+                // Nothing changed on disk, so the next round would fail identically.
+                Log.step("%s", Log.yellow("Could not remediate; stopping to avoid an identical rerun."));
+                break;
+            }
+            analyzer.invalidate(pomFile);
+        }
+        return results;
+    }
+
+    private static String lastLines(String text, int count) {
+        String[] lines = text.split("\\R");
+        int from = Math.max(0, lines.length - count);
+        return String.join(System.lineSeparator(), List.of(lines).subList(from, lines.length));
     }
 
     // ------------------------------------------------------------------
@@ -224,11 +323,11 @@ public class RemediationEngine {
     private List<ScanReport.QuarantinedComponent> handleQuarantine(File pomFile, DependencyNode graph) {
         Log.section("Checking the repository firewall");
 
-        List<Artifact> artifacts = collectArtifacts(graph);
+        List<Artifact> runtimeArtifacts = collectArtifacts(graph);
         List<ScanReport.QuarantinedComponent> results = new ArrayList<>();
         int blocked = 0;
 
-        for (Artifact artifact : artifacts) {
+        for (Artifact artifact : runtimeArtifacts) {
             ArtifactAvailability.Result probe = availability.check(artifact);
             if (!probe.isQuarantined()) {
                 continue;
@@ -238,14 +337,44 @@ public class RemediationEngine {
             results.add(remediateQuarantine(pomFile, graph, artifact, probe));
         }
 
-        Log.step("Probed %d artifact(s); %d quarantined.", artifacts.size(), blocked);
+        // The dependency graph is only part of what a build downloads. Maven plugins and, for
+        // Quarkus, the whole augmentation classpath are resolved too — and a firewall blocking
+        // any of them fails the build on a coordinate that never appears in <dependencies>.
+        List<BuildTimeArtifacts.BuildArtifact> buildTime =
+                buildTimeArtifacts.discover(pomFile, runtimeArtifacts);
+        for (BuildTimeArtifacts.BuildArtifact candidate : buildTime) {
+            ArtifactAvailability.Result probe = availability.check(candidate.artifact());
+            if (!probe.isQuarantined()) {
+                continue;
+            }
+            blocked++;
+            Log.step("%s %s %s", Log.red("quarantined"), candidate.artifact(),
+                    Log.dim("(" + candidate.origin() + ")"));
+            results.add(remediateQuarantine(pomFile, graph, candidate.artifact(), probe,
+                    candidate.origin()));
+        }
+
+        Log.step("Probed %d artifact(s) (%d from the dependency graph, %d build-time); %d quarantined.",
+                runtimeArtifacts.size() + buildTime.size(), runtimeArtifacts.size(), buildTime.size(), blocked);
         return List.copyOf(results);
     }
 
     private ScanReport.QuarantinedComponent remediateQuarantine(File pomFile, DependencyNode graph,
                                                                 Artifact artifact,
                                                                 ArtifactAvailability.Result probe) {
+        return remediateQuarantine(pomFile, graph, artifact, probe, null);
+    }
+
+    private ScanReport.QuarantinedComponent remediateQuarantine(File pomFile, DependencyNode graph,
+                                                                Artifact artifact,
+                                                                ArtifactAvailability.Result probe,
+                                                                String origin) {
         List<String> notes = new ArrayList<>();
+        if (origin != null) {
+            // Without this the coordinate looks like it should be in <dependencies>, and the
+            // reader wastes time looking for something that was never there.
+            notes.add("not in the dependency graph — resolved by the build as a " + origin);
+        }
         List<LocalProjectAnalyzer.GraphPath> paths =
                 analyzer.findPathsTo(graph, artifact.getGroupId(), artifact.getArtifactId());
         String path = paths.isEmpty() ? null : paths.getFirst().render();

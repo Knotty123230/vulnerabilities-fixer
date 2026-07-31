@@ -65,8 +65,8 @@ java -jar vulnchecker.jar -p . --fix-quarantined --align-families --dry-run
 
 ### What runs, in order
 
-1. **Repository firewall** (`--fix-quarantined`) — a quarantined component blocks the build, so it
-   is cleared before anything else looks at the graph.
+1. **Repository firewall** (`--fix-quarantined`, `--from-build-log`, `--verify-build`) — a
+   quarantined component blocks the build, so it is cleared before anything else looks at the graph.
 2. **Vulnerabilities** (`--scan-sonatype`) — one verified fix per component.
 3. **Version skew** — always detected; aligned via BOM import with `--align-families`.
 
@@ -81,6 +81,8 @@ java -jar vulnchecker.jar -p . --fix-quarantined --align-families --dry-run
 | `--check-linkage` | off | Also verify binary compatibility (see below) |
 | `--align-families` | off | Allow importing a family BOM to fix mixed versions (see below) |
 | `--fix-quarantined` | off | Pin components blocked by the repository firewall (see below) |
+| `--from-build-log FILE` | — | Fix everything a saved Maven log shows the firewall rejecting |
+| `--verify-build` | off | Run the build, fix what the firewall blocks, repeat |
 | `--no-check-quarantine` | — | Skip verifying that a chosen version is not quarantined |
 | `--report-format MARKDOWN\|JSON` | `MARKDOWN` | Format for `--report-file` |
 | `--report-file FILE` | — | Write the report to a file as well |
@@ -207,9 +209,35 @@ version, including ones this network will refuse. Choosing a fix from metadata a
 CVE for a broken build, so before a candidate is accepted the artifact is confirmed downloadable.
 Disable with `--no-check-quarantine`.
 
-**Opt-in: `--fix-quarantined`.** Probes every resolved artifact and pins each quarantined one to
-the nearest version the firewall serves. This downloads the classpath — the same work the build
-would do — which is why it is not on by default.
+**Opt-in: `--fix-quarantined`.** Probes every artifact the project resolves and pins each
+quarantined one to the nearest version the firewall serves. The probe covers more than
+`<dependencies>`: Maven plugins with their declared dependencies, and — because Quarkus extensions
+name a `deployment-artifact` in `META-INF/quarkus-extension.properties` — the whole Quarkus
+augmentation classpath, which never appears in the dependency graph.
+
+**When even that is not enough: `--verify-build` and `--from-build-log`.**
+
+Enumerating classpaths from a POM will always miss something. Annotation processors, framework
+bootstrap resolvers that mediate versions independently of the project graph, plugin transitives —
+any of them can demand an artifact the POM analysis cannot see, and then a scan reports "0
+quarantined" while `mvn install` fails on exactly that artifact. The build has no such blind spot:
+whatever it cannot fetch, it names.
+
+```bash
+# Ground truth: run the build, fix what the firewall blocks, repeat
+java -jar vulnchecker.jar -p . --verify-build --dry-run
+
+# Or mine a log you already have
+java -jar vulnchecker.jar -p . --from-build-log build.log --dry-run
+```
+
+Maven aborts at the **first** refusal, so one log reveals one artifact even when several are
+blocked — which is why `--verify-build` loops (`--max-build-rounds`, default 5) rather than running
+once. It stops early when the build succeeds, when a round fixes nothing (the next run would fail
+identically), or when the build fails for a reason that is not the firewall.
+
+Goals default to `package -DskipTests`; override with `--build-goals` when a specific phase is what
+resolves the classpath — for Quarkus, `--build-goals "quarkus:generate-code"` is much faster.
 
 It runs **before** everything else, and works **without a vulnerability scan**:
 

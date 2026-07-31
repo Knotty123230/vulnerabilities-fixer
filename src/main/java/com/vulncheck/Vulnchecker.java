@@ -107,6 +107,35 @@ public class Vulnchecker implements Callable<Integer> {
     private boolean fixQuarantined;
 
     @CommandLine.Option(
+            names = "--from-build-log",
+            paramLabel = "FILE",
+            description = "Read a saved Maven build log and fix every component the repository "
+                    + "firewall rejected in it. Catches artifacts no POM analysis can see — "
+                    + "plugin dependencies, annotation processors, Quarkus augmentation classpaths.")
+    private Path fromBuildLog;
+
+    @CommandLine.Option(
+            names = "--verify-build",
+            description = "Run the project's build, fix whatever the firewall blocks, and repeat. "
+                    + "Maven stops at the first refusal, so this loops until the build resolves "
+                    + "or stops making progress. The most thorough option, and the slowest.")
+    private boolean verifyBuild;
+
+    @CommandLine.Option(
+            names = "--build-goals",
+            paramLabel = "GOALS",
+            defaultValue = MavenBuildRunner.DEFAULT_GOALS,
+            description = "Goals used by --verify-build. Default: ${DEFAULT-VALUE}.")
+    private String buildGoals;
+
+    @CommandLine.Option(
+            names = "--max-build-rounds",
+            paramLabel = "N",
+            defaultValue = "5",
+            description = "Build/fix rounds for --verify-build. Default: ${DEFAULT-VALUE}.")
+    private int maxBuildRounds;
+
+    @CommandLine.Option(
             names = "--check-quarantine",
             negatable = true,
             defaultValue = "true",
@@ -234,10 +263,10 @@ public class Vulnchecker implements Callable<Integer> {
                 // Quarantine and version-skew checks read the dependency graph directly, so they
                 // are useful on their own — and a project blocked by the firewall usually cannot
                 // be scanned at all, since the scanner has to resolve it first.
-                if (!fixQuarantined && !alignFamilies) {
+                if (!fixQuarantined && !alignFamilies && fromBuildLog == null && !verifyBuild) {
                     Log.error("Nothing to do. Pass --scan-sonatype to check for vulnerabilities, "
-                            + "or --fix-quarantined / --align-families to work from the "
-                            + "dependency graph alone.");
+                            + "or one of --fix-quarantined / --from-build-log / --verify-build / "
+                            + "--align-families to work without a scan.");
                     return EXIT_ERROR;
                 }
                 Log.info("No vulnerability scan requested; analysing the dependency graph only.");
@@ -314,11 +343,30 @@ public class Vulnchecker implements Callable<Integer> {
 
         RemediationEngine.Options options = new RemediationEngine.Options(
                 upgradeScope, dryRun, checkLinkage, Math.max(1, maxCandidates), alignFamilies,
-                checkQuarantine, fixQuarantined);
+                checkQuarantine, fixQuarantined,
+                readBuildLog(),
+                verifyBuild ? buildGoals : null,
+                Math.max(1, maxBuildRounds));
 
         return new RemediationEngine(
                 scanReport, repositorySystem, session, repositories, credentials, projectPath, options)
                 .run(pomFile);
+    }
+
+    private String readBuildLog() {
+        if (fromBuildLog == null) {
+            return null;
+        }
+        try {
+            String log = Files.readString(fromBuildLog);
+            Log.info("%-12s %s (%d KB)", "Build log", fromBuildLog, log.length() / 1024);
+            return log;
+        } catch (Exception e) {
+            // Losing the log means losing a whole discovery channel, so say so loudly rather
+            // than proceeding as if the file had been empty.
+            throw new IllegalArgumentException(
+                    "Cannot read the build log " + fromBuildLog + ": " + Log.describe(e), e);
+        }
     }
 
     private void writeReportFile(ScanReport report) {

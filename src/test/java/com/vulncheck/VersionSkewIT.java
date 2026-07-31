@@ -118,7 +118,7 @@ class VersionSkewIT {
         TestRepositories.Wiring wiring = TestRepositories.requireReachableRepository();
         ScanReport report = new RemediationEngine(scan, wiring.system(), wiring.session(),
                 wiring.repositories(), null, projectDir,
-                new RemediationEngine.Options(VersionPolicy.UpgradeScope.MINOR, false, false, 12, true, false, false))
+                new RemediationEngine.Options(VersionPolicy.UpgradeScope.MINOR, false, false, 12, true, false, false, null, null, 5))
                 .run(pom.toFile());
 
         ScanReport.Finding finding = report.findings().getFirst();
@@ -173,7 +173,7 @@ class VersionSkewIT {
         ScanReport report = new RemediationEngine(emptyScan, wiring.system(), wiring.session(),
                 wiring.repositories(), null, projectDir,
                 new RemediationEngine.Options(VersionPolicy.UpgradeScope.MINOR, false, false, 12,
-                        true, false, false))
+                        true, false, false, null, null, 5))
                 .run(pom.toFile());
 
         assertTrue(report.findings().isEmpty(), "no vulnerabilities in this scenario");
@@ -206,7 +206,7 @@ class VersionSkewIT {
         ScanReport report = new RemediationEngine(emptyScan, wiring.system(), wiring.session(),
                 wiring.repositories(), null, projectDir,
                 new RemediationEngine.Options(VersionPolicy.UpgradeScope.MINOR, false, false, 12,
-                        false, false, false))
+                        false, false, false, null, null, 5))
                 .run(pom.toFile());
 
         assertEquals(1, report.familySkews().size());

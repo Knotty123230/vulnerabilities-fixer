@@ -82,7 +82,7 @@ class RemediationEngineIT {
 
         ScanReport report = run(projectDir,
                 reportFor("org.apache.commons", "commons-text", "1.9", "1.10.0"),
-                new RemediationEngine.Options(VersionPolicy.UpgradeScope.MINOR, false, false, 12, false, false, false));
+                new RemediationEngine.Options(VersionPolicy.UpgradeScope.MINOR, false, false, 12, false, false, false, null, null, 5));
 
         ScanReport.Finding finding = report.findings().getFirst();
         assertEquals(ScanReport.Outcome.FIXED, finding.outcome(), () -> finding.notes().toString());
@@ -104,7 +104,7 @@ class RemediationEngineIT {
 
         ScanReport report = run(projectDir,
                 reportFor("org.apache.commons", "commons-text", "1.9", "1.10.0"),
-                new RemediationEngine.Options(VersionPolicy.UpgradeScope.MINOR, true, false, 12, false, false, false));
+                new RemediationEngine.Options(VersionPolicy.UpgradeScope.MINOR, true, false, 12, false, false, false, null, null, 5));
 
         assertEquals(ScanReport.Outcome.WOULD_FIX, report.findings().getFirst().outcome());
         assertEquals(original, Files.readString(pom), "dry run must not modify the POM");
@@ -119,7 +119,7 @@ class RemediationEngineIT {
 
         ScanReport report = run(projectDir,
                 reportFor("com.example", "never-declared", "1.0", "2.0"),
-                new RemediationEngine.Options(VersionPolicy.UpgradeScope.MINOR, true, false, 12, false, false, false));
+                new RemediationEngine.Options(VersionPolicy.UpgradeScope.MINOR, true, false, 12, false, false, false, null, null, 5));
 
         assertEquals(ScanReport.Outcome.NOT_IN_GRAPH, report.findings().getFirst().outcome());
     }
@@ -132,7 +132,7 @@ class RemediationEngineIT {
 
         ScanReport report = run(projectDir,
                 reportFor("org.apache.commons", "commons-text", "1.9", "1.10.0"),
-                new RemediationEngine.Options(VersionPolicy.UpgradeScope.MINOR, true, false, 12, false, false, false));
+                new RemediationEngine.Options(VersionPolicy.UpgradeScope.MINOR, true, false, 12, false, false, false, null, null, 5));
 
         ScanReport.Finding finding = report.findings().getFirst();
         assertEquals(ScanReport.Outcome.NOT_AFFECTED, finding.outcome());
@@ -149,7 +149,7 @@ class RemediationEngineIT {
 
         ScanReport report = run(projectDir,
                 reportFor("org.apache.commons", "commons-text", "1.8", "1.10.0"),
-                new RemediationEngine.Options(VersionPolicy.UpgradeScope.MINOR, false, false, 12, false, false, false));
+                new RemediationEngine.Options(VersionPolicy.UpgradeScope.MINOR, false, false, 12, false, false, false, null, null, 5));
 
         ScanReport.Finding finding = report.findings().getFirst();
         assertEquals(ScanReport.Outcome.FIXED, finding.outcome(), () -> finding.notes().toString());
@@ -173,7 +173,7 @@ class RemediationEngineIT {
 
         ScanReport report = run(projectDir,
                 reportFor("commons-codec", "commons-codec", "1.11", "1.13"),
-                new RemediationEngine.Options(VersionPolicy.UpgradeScope.MINOR, false, false, 12, false, false, false));
+                new RemediationEngine.Options(VersionPolicy.UpgradeScope.MINOR, false, false, 12, false, false, false, null, null, 5));
 
         ScanReport.Finding finding = report.findings().getFirst();
         assertEquals(ScanReport.Outcome.FIXED, finding.outcome(), () -> finding.notes().toString());
@@ -197,7 +197,7 @@ class RemediationEngineIT {
 
         ScanReport report = run(projectDir,
                 reportFor("org.apache.commons", "commons-text", "1.8", "1.10.0"),
-                new RemediationEngine.Options(VersionPolicy.UpgradeScope.PATCH, false, false, 12, false, false, false));
+                new RemediationEngine.Options(VersionPolicy.UpgradeScope.PATCH, false, false, 12, false, false, false, null, null, 5));
 
         ScanReport.Finding finding = report.findings().getFirst();
         assertEquals(ScanReport.Outcome.NO_WORKING_FIX, finding.outcome());
