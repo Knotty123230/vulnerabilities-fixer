@@ -111,16 +111,19 @@ public class RemediationEngine {
         // The firewall runs first, before anything else looks at the graph. A quarantined
         // component stops the build outright, so it outranks every vulnerability in the report —
         // and clearing it produces the resolvable graph the remediation pass then reasons about.
+        // The same artifact is routinely found by more than one discovery phase; without a
+        // shared record it would be remediated twice and reported twice.
+        Set<String> quarantineHandled = new LinkedHashSet<>();
         List<ScanReport.QuarantinedComponent> quarantined = new ArrayList<>();
         if (options.fixQuarantined()) {
-            quarantined.addAll(handleQuarantine(pomFile, graph));
+            quarantined.addAll(handleQuarantine(pomFile, graph, quarantineHandled));
         }
         if (options.buildLog() != null) {
-            quarantined.addAll(fixQuarantineFrom(
-                    pomFile, graph, BuildLogQuarantineScanner.scan(options.buildLog()), "build log"));
+            quarantined.addAll(fixQuarantineFrom(pomFile, graph,
+                    BuildLogQuarantineScanner.scan(options.buildLog()), "build log", quarantineHandled));
         }
         if (options.buildGoals() != null) {
-            quarantined.addAll(fixQuarantineByBuilding(pomFile, graph));
+            quarantined.addAll(fixQuarantineByBuilding(pomFile, graph, quarantineHandled));
         }
         if (quarantined.stream().anyMatch(c -> c.outcome() == ScanReport.Outcome.FIXED)) {
             analyzer.invalidate(pomFile);
@@ -193,8 +196,12 @@ public class RemediationEngine {
      * clean while {@code mvn install} fails.
      */
     private List<ScanReport.QuarantinedComponent> fixQuarantineFrom(
-            File pomFile, DependencyNode graph, List<BuildLogQuarantineScanner.Hit> hits, String origin) {
+            File pomFile, DependencyNode graph, List<BuildLogQuarantineScanner.Hit> allHits,
+            String origin, Set<String> handled) {
 
+        List<BuildLogQuarantineScanner.Hit> hits = allHits.stream()
+                .filter(hit -> handled.add(gavOf(hit.artifact())))
+                .toList();
         if (hits.isEmpty()) {
             Log.debug("No quarantined artifacts named in the %s", origin);
             return List.of();
@@ -207,7 +214,7 @@ public class RemediationEngine {
                     ArtifactAvailability.Status.QUARANTINED, hit.quarantineUrl(),
                     "reported by the build");
             results.add(remediateQuarantine(pomFile, graph, hit.artifact(), probe,
-                    "resolved by the build, not present in the dependency graph"));
+                    "reported by the build itself (" + origin + ")"));
         }
         return results;
     }
@@ -219,7 +226,8 @@ public class RemediationEngine {
      * several are blocked. Looping is what actually unblocks a project — and re-running is also the
      * only honest confirmation that a fix worked, since the build is the thing that has to succeed.
      */
-    private List<ScanReport.QuarantinedComponent> fixQuarantineByBuilding(File pomFile, DependencyNode graph) {
+    private List<ScanReport.QuarantinedComponent> fixQuarantineByBuilding(
+            File pomFile, DependencyNode graph, Set<String> handled) {
         Log.section("Probing the build for firewall failures");
 
         MavenBuildRunner runner = new MavenBuildRunner(projectPath);
@@ -238,6 +246,13 @@ public class RemediationEngine {
             List<BuildLogQuarantineScanner.Hit> hits = BuildLogQuarantineScanner.scan(build.output()).stream()
                     .filter(hit -> alreadySeen.add(hit.gav()))
                     .toList();
+            boolean anyNew = hits.stream().anyMatch(hit -> !handled.contains(gavOf(hit.artifact())));
+            if (!hits.isEmpty() && !anyNew) {
+                // Already dealt with above and it did not help; another round changes nothing.
+                Log.step("%s", Log.yellow(
+                        "Build is still blocked by an artifact that could not be remediated — stopping."));
+                break;
+            }
             if (hits.isEmpty()) {
                 // The build failed for some other reason — compilation, tests, anything. Not this
                 // tool's problem to diagnose, and silently retrying would just waste time.
@@ -248,7 +263,7 @@ public class RemediationEngine {
             }
 
             List<ScanReport.QuarantinedComponent> round1 =
-                    fixQuarantineFrom(pomFile, graph, hits, "build output");
+                    fixQuarantineFrom(pomFile, graph, hits, "build output", handled);
             results.addAll(round1);
 
             if (round1.stream().noneMatch(c -> c.outcome() == ScanReport.Outcome.FIXED)) {
@@ -320,7 +335,8 @@ public class RemediationEngine {
      * the build itself would do, and it is the only way to learn the answer — but it is why this
      * runs behind {@code --fix-quarantined} rather than always.
      */
-    private List<ScanReport.QuarantinedComponent> handleQuarantine(File pomFile, DependencyNode graph) {
+    private List<ScanReport.QuarantinedComponent> handleQuarantine(
+            File pomFile, DependencyNode graph, Set<String> handled) {
         Log.section("Checking the repository firewall");
 
         List<Artifact> runtimeArtifacts = collectArtifacts(graph);
@@ -333,6 +349,9 @@ public class RemediationEngine {
                 continue;
             }
             blocked++;
+            if (!handled.add(gavOf(artifact))) {
+                continue;
+            }
             Log.step("%s %s", Log.red("quarantined"), artifact);
             results.add(remediateQuarantine(pomFile, graph, artifact, probe));
         }
@@ -348,10 +367,13 @@ public class RemediationEngine {
                 continue;
             }
             blocked++;
+            if (!handled.add(gavOf(candidate.artifact()))) {
+                continue;
+            }
             Log.step("%s %s %s", Log.red("quarantined"), candidate.artifact(),
                     Log.dim("(" + candidate.origin() + ")"));
             results.add(remediateQuarantine(pomFile, graph, candidate.artifact(), probe,
-                    candidate.origin()));
+                    "resolved by the build as a " + candidate.origin()));
         }
 
         Log.step("Probed %d artifact(s) (%d from the dependency graph, %d build-time); %d quarantined.",
@@ -373,33 +395,49 @@ public class RemediationEngine {
         if (origin != null) {
             // Without this the coordinate looks like it should be in <dependencies>, and the
             // reader wastes time looking for something that was never there.
-            notes.add("not in the dependency graph — resolved by the build as a " + origin);
+            notes.add("not in the dependency graph — " + origin);
         }
         List<LocalProjectAnalyzer.GraphPath> paths =
                 analyzer.findPathsTo(graph, artifact.getGroupId(), artifact.getArtifactId());
         String path = paths.isEmpty() ? null : paths.getFirst().render();
 
-        List<String> candidates = versionCatalog.upgradeCandidates(
+        List<String> upgrades = versionCatalog.upgradeCandidates(
                 artifact.getGroupId(), artifact.getArtifactId(), artifact.getExtension(),
                 artifact.getVersion(), options.upgradeScope());
 
-        if (candidates.isEmpty()) {
-            notes.add("no newer version within the " + options.upgradeScope().describe()
-                    + " policy; try --upgrade-scope major");
-            return quarantineResult(artifact, probe, path, null,
-                    ScanReport.Outcome.NO_WORKING_FIX, notes);
-        }
-
         // Ascending, so the smallest move that the firewall accepts wins.
         Optional<String> replacement = availability.firstUsable(
-                artifact.getGroupId(), artifact.getArtifactId(), artifact.getExtension(), candidates);
+                artifact.getGroupId(), artifact.getArtifactId(), artifact.getExtension(), upgrades);
+
+        boolean downgraded = false;
         if (replacement.isEmpty()) {
-            notes.add("every candidate version is also quarantined (tried " + candidates.size() + ")");
-            return quarantineResult(artifact, probe, path, null,
-                    ScanReport.Outcome.NO_WORKING_FIX, notes);
+            // Upgrading is not always possible: the newest release can be the quarantined one,
+            // and an artifact that was renamed upstream has no successor under this coordinate at
+            // all — kotlinx-metadata-jvm ends at 0.9.0 because Kotlin 2.0 moved it. When a build is
+            // blocked, stepping back to the nearest release the firewall allows is a real fix,
+            // so the search continues downwards rather than giving up.
+            List<String> downgrades = cap(downgradeCandidates(artifact));
+            replacement = availability.firstUsable(
+                    artifact.getGroupId(), artifact.getArtifactId(), artifact.getExtension(), downgrades);
+            downgraded = replacement.isPresent();
+
+            if (replacement.isEmpty()) {
+                notes.add(upgrades.isEmpty() && downgrades.isEmpty()
+                        ? policyExhaustedNote()
+                        : "no version the firewall allows: tried " + upgrades.size()
+                                + " newer and " + downgrades.size() + " older release(s)");
+                return quarantineResult(artifact, probe, path, null,
+                        ScanReport.Outcome.NO_WORKING_FIX, notes);
+            }
         }
 
         String version = replacement.get();
+        if (downgraded) {
+            // Loud, because it is the one outcome here that can make things worse.
+            notes.add("DOWNGRADE from " + artifact.getVersion() + " to " + version
+                    + " — no allowed newer release exists. Verify API compatibility, and note that "
+                    + "an older release may carry vulnerabilities of its own.");
+        }
         String pomContent = pomFixer.previewManagedOverride(
                 pomFile, artifact.getGroupId(), artifact.getArtifactId(), version);
         if (pomContent == null) {
@@ -423,6 +461,21 @@ public class RemediationEngine {
         }
     }
 
+    /**
+     * Published versions below the current one, nearest first.
+     *
+     * <p>Nearest-first keeps the step as small as possible: a downgrade is a compatibility risk,
+     * and one patch back is far safer than several minors back.
+     */
+    private List<String> downgradeCandidates(Artifact artifact) {
+        return versionCatalog.availableVersions(
+                        artifact.getGroupId(), artifact.getArtifactId(), artifact.getExtension()).stream()
+                .filter(version -> !VersionPolicy.isPreRelease(version))
+                .filter(version -> VersionPolicy.compare(version, artifact.getVersion()) < 0)
+                .sorted(VersionPolicy.descending())
+                .toList();
+    }
+
     private static ScanReport.QuarantinedComponent quarantineResult(Artifact artifact,
                                                                     ArtifactAvailability.Result probe,
                                                                     String path, String replacement,
@@ -431,6 +484,10 @@ public class RemediationEngine {
         return new ScanReport.QuarantinedComponent(
                 artifact.getGroupId(), artifact.getArtifactId(), artifact.getVersion(),
                 probe.quarantineUrl(), path, replacement, outcome, List.copyOf(notes));
+    }
+
+    private static String gavOf(Artifact artifact) {
+        return artifact.getGroupId() + ":" + artifact.getArtifactId() + ":" + artifact.getVersion();
     }
 
     private static List<Artifact> collectArtifacts(DependencyNode root) {
@@ -694,8 +751,7 @@ public class RemediationEngine {
         }
         if (attempted.isEmpty()) {
             return builder.outcome(ScanReport.Outcome.NO_WORKING_FIX)
-                    .note("no upgrade candidate exists within the "
-                            + options.upgradeScope().describe() + " policy; try --upgrade-scope major")
+                    .note(policyExhaustedNote())
                     .build();
         }
         return builder.outcome(ScanReport.Outcome.NO_WORKING_FIX)
@@ -876,6 +932,23 @@ public class RemediationEngine {
                 skew.get().highestVersion(), cap(candidates),
                 version -> pomFixer.previewBomImport(
                         pomFile, bom.groupId(), bom.artifactId(), version, vulnerability.groupId())));
+    }
+
+    /**
+     * Explains an empty candidate list.
+     *
+     * <p>At MAJOR scope the search was unrestricted, so an empty result means the repository has
+     * nothing newer at all — usually because the artifact was renamed or discontinued, which no
+     * version bump can repair. Suggesting a wider scope there would send the user in circles.
+     */
+    private String policyExhaustedNote() {
+        if (options.upgradeScope() == VersionPolicy.UpgradeScope.MAJOR) {
+            return "no newer version exists in the repository at all — the artifact was likely "
+                    + "renamed or discontinued, so a version bump cannot fix this. Replace the "
+                    + "dependency, or ask for a firewall policy waiver.";
+        }
+        return "no newer version within the " + options.upgradeScope().describe()
+                + " policy; try --upgrade-scope major";
     }
 
     /** The lowest version the scanner considers remediated, or {@code null} when it offers none. */

@@ -187,6 +187,18 @@ public class MavenPomFixer {
             if (upgraded != null) {
                 return upgraded;
             }
+
+            // UpgradeDependencyVersion only ever moves a version forward, so a declared dependency
+            // that has to move *back* — the case when the quarantined release is also the newest
+            // one published — needs a recipe that simply sets the version.
+            String changed = runRecipe(
+                    new ChangeDependencyGroupIdAndArtifactId(
+                            groupId, artifactId, groupId, artifactId, version, null, true, true),
+                    docs, ctx);
+            if (changed != null) {
+                return changed;
+            }
+
             return runRecipe(
                     new AddManagedDependency(groupId, artifactId, version,
                             null, null, null, null, null, groupId + ":" + artifactId, null,

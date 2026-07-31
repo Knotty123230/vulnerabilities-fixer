@@ -64,6 +64,12 @@ class QuarantineRemediationIT {
     @TempDir(cleanup = org.junit.jupiter.api.io.CleanupMode.ALWAYS)
     static Path sharedLocalRepository;
 
+    /** When set, every version of this artifact path prefix is refused. */
+    private volatile String quarantinedPrefix;
+    /** Set when a test decides to quarantine the newest release of an artifact. */
+    private volatile String extraQuarantinedPath;
+    private String newestCommonsIo;
+
     private HttpServer server;
     private ExecutorService serverPool;
     private String baseUrl;
@@ -78,7 +84,9 @@ class QuarantineRemediationIT {
         server.setExecutor(serverPool);
         server.createContext("/", exchange -> {
             String path = exchange.getRequestURI().getPath();
-            if (QUARANTINED_PATH.equals(path)) {
+            boolean wholeArtifactBlocked = quarantinedPrefix != null
+                    && path.startsWith(quarantinedPrefix) && path.endsWith(".jar");
+            if (QUARANTINED_PATH.equals(path) || path.equals(extraQuarantinedPath) || wholeArtifactBlocked) {
                 byte[] body = QUARANTINE_BODY.getBytes(StandardCharsets.UTF_8);
                 exchange.sendResponseHeaders(403, body.length);
                 try (OutputStream out = exchange.getResponseBody()) {
@@ -123,6 +131,20 @@ class QuarantineRemediationIT {
         if (serverPool != null) {
             serverPool.shutdownNow();
         }
+    }
+
+    /** Blocks the newest published release of an artifact, as a firewall would. */
+    private void quarantineNewestVersionOf(String groupId, String artifactId) throws Exception {
+        String metadata = new String(URI.create("https://repo.maven.apache.org/maven2/"
+                + groupId.replace('.', '/') + "/" + artifactId + "/maven-metadata.xml")
+                .toURL().openStream().readAllBytes(), StandardCharsets.UTF_8);
+        java.util.regex.Matcher matcher =
+                java.util.regex.Pattern.compile("<release>([^<]+)</release>").matcher(metadata);
+        org.junit.jupiter.api.Assumptions.assumeTrue(matcher.find(), "no <release> in metadata");
+
+        newestCommonsIo = matcher.group(1);
+        extraQuarantinedPath = "/" + groupId.replace('.', '/') + "/" + artifactId + "/"
+                + newestCommonsIo + "/" + artifactId + "-" + newestCommonsIo + ".jar";
     }
 
     /** Confirms the stub is reachable before drawing conclusions from a failure. */
@@ -173,6 +195,38 @@ class QuarantineRemediationIT {
     }
 
     @Test
+    @DisplayName("downgrades when the quarantined version is the newest one published")
+    void downgradesWhenNoNewerVersionExists(@TempDir Path projectDir) throws Exception {
+        assumeStubUsable();
+
+        // Mirrors the real case: kotlinx-metadata-jvm ends at 0.9.0 because Kotlin 2.0 renamed the
+        // artifact, so the quarantined release is also the last one. Searching only upwards finds
+        // nothing and leaves the build blocked; stepping back is the only available fix.
+        quarantineNewestVersionOf("commons-io", "commons-io");
+
+        Path pom = projectDir.resolve("pom.xml");
+        Files.writeString(pom, """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <project xmlns="http://maven.apache.org/POM/4.0.0"><modelVersion>4.0.0</modelVersion>
+                <groupId>com.example</groupId><artifactId>svc</artifactId><version>1.0.0</version>
+                <dependencies><dependency><groupId>commons-io</groupId>
+                <artifactId>commons-io</artifactId><version>%s</version></dependency></dependencies>
+                </project>
+                """.formatted(newestCommonsIo));
+
+        ScanReport report = runEngine(projectDir, true);
+
+        assertEquals(1, report.quarantined().size(), report.quarantined().toString());
+        ScanReport.QuarantinedComponent component = report.quarantined().getFirst();
+
+        assertEquals(ScanReport.Outcome.FIXED, component.outcome(), () -> component.notes().toString());
+        assertTrue(VersionPolicy.compare(component.replacementVersion(), newestCommonsIo) < 0,
+                "expected a downgrade, got " + component.replacementVersion());
+        assertTrue(component.notes().stream().anyMatch(note -> note.contains("DOWNGRADE")),
+                "a downgrade must be called out explicitly: " + component.notes());
+    }
+
+    @Test
     @DisplayName("a quarantined component fails the gate no matter the severity threshold")
     void quarantineIsBlocking(@TempDir Path projectDir) throws Exception {
         assumeStubUsable();
@@ -186,19 +240,28 @@ class QuarantineRemediationIT {
                 </project>
                 """);
 
-        // PATCH scope leaves no candidate on the 1.10.x line, so it cannot be remediated.
-        ScanReport report = runEngine(projectDir, false);
+        // Every version of the artifact is refused, so neither an upgrade nor a downgrade can
+        // help. This is the only genuinely unremediable shape now that the search goes both ways.
+        quarantinedPrefix = "/org/apache/commons/commons-text/";
+        // A private local repository: the shared one already holds jars an earlier test fetched,
+        // and a cache hit never reaches the stub, so the block would go unnoticed.
+        ScanReport report = runEngine(projectDir, true, projectDir.resolve("private-repo"));
 
         assertTrue(report.hasBlockingQuarantine());
         assertEquals(1, report.unresolvedQuarantines().size());
     }
 
     private ScanReport runEngine(Path projectDir, boolean allowMinor) throws Exception {
+        return runEngine(projectDir, allowMinor, sharedLocalRepository);
+    }
+
+    private ScanReport runEngine(Path projectDir, boolean allowMinor, Path localRepository)
+            throws Exception {
         NexusCredentials credentials = new NexusCredentials(baseUrl, null, null);
         RepositorySystem system = MavenResolverFactory.createRepositorySystem();
         // A private local repository, so nothing is answered from an earlier download.
         RepositorySystemSession session = MavenResolverFactory.createSession(
-                system, sharedLocalRepository, credentials, null);
+                system, localRepository, credentials, null);
         List<RemoteRepository> repositories =
                 MavenResolverFactory.createRepositories(system, session, credentials, null);
 

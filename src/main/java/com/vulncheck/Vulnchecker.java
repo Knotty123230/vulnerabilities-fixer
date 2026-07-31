@@ -247,7 +247,11 @@ public class Vulnchecker implements Callable<Integer> {
     private boolean saveSonatypeCredentials;
 
     public static void main(String[] args) {
-        System.exit(new CommandLine(new Vulnchecker()).execute(args));
+        // Enum options are documented in lower case in the examples and that is how people type
+        // them; without this, `--upgrade-scope major` fails with a usage dump instead of running.
+        System.exit(new CommandLine(new Vulnchecker())
+                .setCaseInsensitiveEnumValuesAllowed(true)
+                .execute(args));
     }
 
     @Override
@@ -359,7 +363,7 @@ public class Vulnchecker implements Callable<Integer> {
         }
         try {
             String log = Files.readString(fromBuildLog);
-            Log.info("%-12s %s (%d KB)", "Build log", fromBuildLog, log.length() / 1024);
+            Log.info("%-12s %s (%,d bytes)", "Build log", fromBuildLog, log.length());
             return log;
         } catch (Exception e) {
             // Losing the log means losing a whole discovery channel, so say so loudly rather
