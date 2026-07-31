@@ -13,8 +13,10 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
@@ -112,8 +114,12 @@ public class RemediationEngine {
         // component stops the build outright, so it outranks every vulnerability in the report —
         // and clearing it produces the resolvable graph the remediation pass then reasons about.
         // The same artifact is routinely found by more than one discovery phase; without a
-        // shared record it would be remediated twice and reported twice.
-        Set<String> quarantineHandled = new LinkedHashSet<>();
+        // shared record it would be remediated twice and reported twice. Keyed to the outcome,
+        // not just membership, so a later phase can tell "we never found a fix for this" apart
+        // from "we wrote a fix, but the build still failed on the exact same version" — the
+        // second case means the build's own resolver does not honour the POM change, which is a
+        // fundamentally different problem calling for a different message.
+        Map<String, ScanReport.QuarantinedComponent> quarantineHandled = new LinkedHashMap<>();
         List<ScanReport.QuarantinedComponent> quarantined = new ArrayList<>();
         if (options.fixQuarantined()) {
             quarantined.addAll(handleQuarantine(pomFile, graph, quarantineHandled));
@@ -197,10 +203,10 @@ public class RemediationEngine {
      */
     private List<ScanReport.QuarantinedComponent> fixQuarantineFrom(
             File pomFile, DependencyNode graph, List<BuildLogQuarantineScanner.Hit> allHits,
-            String origin, Set<String> handled) {
+            String origin, Map<String, ScanReport.QuarantinedComponent> handled) {
 
         List<BuildLogQuarantineScanner.Hit> hits = allHits.stream()
-                .filter(hit -> handled.add(gavOf(hit.artifact())))
+                .filter(hit -> !handled.containsKey(gavOf(hit.artifact())))
                 .toList();
         if (hits.isEmpty()) {
             Log.debug("No quarantined artifacts named in the %s", origin);
@@ -213,8 +219,10 @@ public class RemediationEngine {
             ArtifactAvailability.Result probe = new ArtifactAvailability.Result(
                     ArtifactAvailability.Status.QUARANTINED, hit.quarantineUrl(),
                     "reported by the build");
-            results.add(remediateQuarantine(pomFile, graph, hit.artifact(), probe,
-                    "reported by the build itself (" + origin + ")"));
+            ScanReport.QuarantinedComponent result = remediateQuarantine(pomFile, graph, hit.artifact(), probe,
+                    "reported by the build itself (" + origin + ")");
+            handled.put(gavOf(hit.artifact()), result);
+            results.add(result);
         }
         return results;
     }
@@ -227,7 +235,7 @@ public class RemediationEngine {
      * only honest confirmation that a fix worked, since the build is the thing that has to succeed.
      */
     private List<ScanReport.QuarantinedComponent> fixQuarantineByBuilding(
-            File pomFile, DependencyNode graph, Set<String> handled) {
+            File pomFile, DependencyNode graph, Map<String, ScanReport.QuarantinedComponent> handled) {
         Log.section("Probing the build for firewall failures");
 
         MavenBuildRunner runner = new MavenBuildRunner(projectPath);
@@ -246,13 +254,6 @@ public class RemediationEngine {
             List<BuildLogQuarantineScanner.Hit> hits = BuildLogQuarantineScanner.scan(build.output()).stream()
                     .filter(hit -> alreadySeen.add(hit.gav()))
                     .toList();
-            boolean anyNew = hits.stream().anyMatch(hit -> !handled.contains(gavOf(hit.artifact())));
-            if (!hits.isEmpty() && !anyNew) {
-                // Already dealt with above and it did not help; another round changes nothing.
-                Log.step("%s", Log.yellow(
-                        "Build is still blocked by an artifact that could not be remediated — stopping."));
-                break;
-            }
             if (hits.isEmpty()) {
                 // The build failed for some other reason — compilation, tests, anything. Not this
                 // tool's problem to diagnose, and silently retrying would just waste time.
@@ -262,8 +263,42 @@ public class RemediationEngine {
                 break;
             }
 
+            // A hit whose GAV is already in `handled` was reached by an earlier phase. Two very
+            // different situations produce that: no fix could be found for it at all, or a fix
+            // WAS written and yet the build asked for the exact same quarantined version again.
+            // The second case is the one that looks like a silent failure of this tool but is
+            // not — it means the resolver that failed (a plugin's own, or Quarkus's bootstrap
+            // resolver building the deployment classpath) does not consult the project's
+            // dependencyManagement for this classpath at all, so no version pin in the POM can
+            // reach it. That is worth saying outright rather than repeating "could not remediate".
+            List<BuildLogQuarantineScanner.Hit> alreadyHandled = hits.stream()
+                    .filter(hit -> handled.containsKey(gavOf(hit.artifact())))
+                    .toList();
+            List<BuildLogQuarantineScanner.Hit> unhandled = hits.stream()
+                    .filter(hit -> !handled.containsKey(gavOf(hit.artifact())))
+                    .toList();
+
+            if (unhandled.isEmpty()) {
+                for (BuildLogQuarantineScanner.Hit hit : alreadyHandled) {
+                    ScanReport.QuarantinedComponent previous = handled.get(gavOf(hit.artifact()));
+                    if (previous.outcome() == ScanReport.Outcome.FIXED
+                            || previous.outcome() == ScanReport.Outcome.WOULD_FIX) {
+                        Log.step("%s", Log.red(hit.gav()
+                                + " was pinned to " + previous.replacementVersion()
+                                + ", but the build requested the quarantined version again."));
+                        Log.step("  %s", Log.yellow("This classpath's own resolver does not honour "
+                                + "the project's dependencyManagement — no version pin in this POM "
+                                + "can reach it. A firewall policy waiver is the only remaining option."));
+                    } else {
+                        Log.step("%s", Log.yellow(hit.gav()
+                                + " could not be remediated earlier (see the report for why) — stopping."));
+                    }
+                }
+                break;
+            }
+
             List<ScanReport.QuarantinedComponent> round1 =
-                    fixQuarantineFrom(pomFile, graph, hits, "build output", handled);
+                    fixQuarantineFrom(pomFile, graph, unhandled, "build output", handled);
             results.addAll(round1);
 
             if (round1.stream().noneMatch(c -> c.outcome() == ScanReport.Outcome.FIXED)) {
@@ -336,7 +371,7 @@ public class RemediationEngine {
      * runs behind {@code --fix-quarantined} rather than always.
      */
     private List<ScanReport.QuarantinedComponent> handleQuarantine(
-            File pomFile, DependencyNode graph, Set<String> handled) {
+            File pomFile, DependencyNode graph, Map<String, ScanReport.QuarantinedComponent> handled) {
         Log.section("Checking the repository firewall");
 
         List<Artifact> runtimeArtifacts = collectArtifacts(graph);
@@ -349,11 +384,13 @@ public class RemediationEngine {
                 continue;
             }
             blocked++;
-            if (!handled.add(gavOf(artifact))) {
+            if (handled.containsKey(gavOf(artifact))) {
                 continue;
             }
             Log.step("%s %s", Log.red("quarantined"), artifact);
-            results.add(remediateQuarantine(pomFile, graph, artifact, probe));
+            ScanReport.QuarantinedComponent result = remediateQuarantine(pomFile, graph, artifact, probe);
+            handled.put(gavOf(artifact), result);
+            results.add(result);
         }
 
         // The dependency graph is only part of what a build downloads. Maven plugins and, for
@@ -367,13 +404,15 @@ public class RemediationEngine {
                 continue;
             }
             blocked++;
-            if (!handled.add(gavOf(candidate.artifact()))) {
+            if (handled.containsKey(gavOf(candidate.artifact()))) {
                 continue;
             }
             Log.step("%s %s %s", Log.red("quarantined"), candidate.artifact(),
                     Log.dim("(" + candidate.origin() + ")"));
-            results.add(remediateQuarantine(pomFile, graph, candidate.artifact(), probe,
-                    "resolved by the build as a " + candidate.origin()));
+            ScanReport.QuarantinedComponent result = remediateQuarantine(pomFile, graph, candidate.artifact(), probe,
+                    "resolved by the build as a " + candidate.origin());
+            handled.put(gavOf(candidate.artifact()), result);
+            results.add(result);
         }
 
         Log.step("Probed %d artifact(s) (%d from the dependency graph, %d build-time); %d quarantined.",
