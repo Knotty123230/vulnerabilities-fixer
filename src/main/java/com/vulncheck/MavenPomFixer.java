@@ -1,5 +1,10 @@
 package com.vulncheck;
 
+import org.apache.maven.model.Dependency;
+import org.apache.maven.model.DependencyManagement;
+import org.apache.maven.model.Model;
+import org.apache.maven.model.io.xpp3.MavenXpp3Reader;
+import org.apache.maven.model.io.xpp3.MavenXpp3Writer;
 import org.eclipse.aether.artifact.Artifact;
 import org.openrewrite.ExecutionContext;
 import org.openrewrite.InMemoryExecutionContext;
@@ -21,10 +26,14 @@ import org.openrewrite.tree.ParseError;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.Reader;
+import java.io.StringWriter;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 
 /**
  * Produces edited POM content via OpenRewrite recipes.
@@ -274,6 +283,21 @@ public class MavenPomFixer {
                 return new OverridePreview(added, null);
             }
 
+            // Last resort, and only when the caller explicitly wants an unconditional pin.
+            // OpenRewrite's Maven recipes reason about the project's OWN resolved dependency
+            // model; an artifact that exists only in a separate resolver's universe — Quarkus's
+            // bootstrap resolver building its augmentation classpath is exactly this case — is
+            // invisible to that model even with the repository correctly configured, and
+            // AddManagedDependency can then decide there is nothing to do without raising any
+            // error at all. There is no recipe-level lever left at that point, so the entry is
+            // written by direct model manipulation instead.
+            if (!onlyIfUsed) {
+                String raw = addOrUpdateManagedDependencyRaw(pomFile, groupId, artifactId, version);
+                if (raw != null) {
+                    return new OverridePreview(raw, null);
+                }
+            }
+
             return new OverridePreview(null, describeNoChange(recipeErrors, groupId, artifactId, version));
 
         } catch (Exception e) {
@@ -282,6 +306,54 @@ public class MavenPomFixer {
             Log.warn("Managed-override preview failed for %s:%s -> %s: %s",
                     groupId, artifactId, version, Log.describe(e));
             return new OverridePreview(null, "recipe execution threw: " + Log.describe(e));
+        }
+    }
+
+    /**
+     * Adds or updates a {@code dependencyManagement} entry by editing the raw Maven model,
+     * bypassing OpenRewrite's recipe engine entirely.
+     *
+     * <p>Trades OpenRewrite's format-preserving diff (comments, formatting, element order) for a
+     * guaranteed write — the right trade when the alternative is not being able to express the edit
+     * at all. Only reached for artifacts outside the project's own dependency model, so the diff
+     * cost lands on an entry a human was never going to hand-tune anyway.
+     */
+    /* package */ String addOrUpdateManagedDependencyRaw(File pomFile, String groupId, String artifactId,
+                                                          String version) {
+        try {
+            MavenXpp3Reader reader = new MavenXpp3Reader();
+            Model model;
+            try (Reader in = Files.newBufferedReader(pomFile.toPath(), StandardCharsets.UTF_8)) {
+                model = reader.read(in);
+            }
+
+            if (model.getDependencyManagement() == null) {
+                model.setDependencyManagement(new DependencyManagement());
+            }
+            List<Dependency> managed = model.getDependencyManagement().getDependencies();
+
+            Optional<Dependency> existing = managed.stream()
+                    .filter(d -> groupId.equals(d.getGroupId()) && artifactId.equals(d.getArtifactId()))
+                    .findFirst();
+
+            if (existing.isPresent()) {
+                existing.get().setVersion(version);
+            } else {
+                Dependency dependency = new Dependency();
+                dependency.setGroupId(groupId);
+                dependency.setArtifactId(artifactId);
+                dependency.setVersion(version);
+                managed.add(dependency);
+            }
+
+            StringWriter writer = new StringWriter();
+            new MavenXpp3Writer().write(writer, model);
+            return writer.toString();
+
+        } catch (Exception e) {
+            Log.warn("Raw managed-dependency fallback failed for %s:%s -> %s: %s",
+                    groupId, artifactId, version, Log.describe(e));
+            return null;
         }
     }
 
